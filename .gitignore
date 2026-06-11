@@ -1,0 +1,22 @@
+# Runtime data
+/data/*.sqlite3
+/data/*.sqlite3-*
+/data/*.db
+/data/server.log
+/.runtime-config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+
+# OS/editor
+.DS_Store
+*.swp
+*.swo
+
+# Logs
+*.log

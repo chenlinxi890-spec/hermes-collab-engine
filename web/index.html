@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hermes 协同引擎管理面板</title>
+  <style>
+    :root{--bg:#f4f7fb;--card:#fff;--text:#172033;--muted:#667085;--line:#e6eaf2;--primary:#2563eb;--primary2:#1d4ed8;--ok:#16a34a;--bad:#dc2626;--warn:#d97706;--info:#0284c7;--shadow:0 8px 24px rgba(20,30,55,.08)}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}header{background:linear-gradient(135deg,#10213f,#1d4ed8);color:#fff;padding:22px 28px;box-shadow:var(--shadow)}.top{max-width:1380px;margin:auto;display:flex;align-items:center;justify-content:space-between;gap:16px}.brand h1{font-size:24px;margin:0 0 6px}.brand p{margin:0;color:#dbeafe;font-size:14px}.live{padding:7px 12px;border-radius:999px;background:rgba(255,255,255,.14);font-size:13px}.container{max-width:1380px;margin:0 auto;padding:22px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px;margin-bottom:16px;box-shadow:var(--shadow)}.metric{display:flex;align-items:center;justify-content:space-between}.metric .num{font-size:34px;font-weight:800;color:#1d4ed8}.metric .name{font-size:14px;color:var(--muted);margin-top:4px}.metric .icon{font-size:30px;background:#eef4ff;border-radius:14px;padding:10px}.section-title{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:14px}.section-title h2{font-size:18px;margin:0}.section-title p{margin:6px 0 0;color:var(--muted);font-size:13px;line-height:1.5}.form-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.field label{display:block;font-size:13px;font-weight:700;margin-bottom:6px}.hint{font-size:12px;color:var(--muted);margin-top:5px;line-height:1.4}textarea,input{width:100%;border:1px solid #d6ddea;border-radius:12px;background:#fff;color:var(--text);padding:12px 13px;font-size:14px;outline:none}textarea:focus,input:focus{border-color:var(--primary);box-shadow:0 0 0 3px rgba(37,99,235,.12)}textarea{resize:vertical;min-height:120px;line-height:1.55}.actions{display:flex;gap:10px;margin-top:14px;align-items:center}.btn{border:0;border-radius:12px;background:var(--primary);color:white;padding:11px 18px;font-weight:700;cursor:pointer}.btn:hover{background:var(--primary2)}.btn.secondary{background:#edf2ff;color:#1d4ed8}.notice{background:#f8fafc;border:1px dashed #cbd5e1;color:#475569;border-radius:12px;padding:12px;font-size:13px;line-height:1.55}.cols{display:grid;grid-template-columns:1.25fr .75fr;gap:16px}table{width:100%;border-collapse:collapse}th,td{padding:11px 10px;border-bottom:1px solid var(--line);text-align:left;font-size:13px;vertical-align:top}th{background:#f8fafc;color:#475569;font-weight:800}.link{color:#2563eb;text-decoration:none;font-weight:700}.tag{display:inline-flex;padding:3px 9px;border-radius:999px;font-size:12px;font-weight:800}.tag.ok{background:#dcfce7;color:#166534}.tag.bad{background:#fee2e2;color:#991b1b}.tag.warn{background:#fef3c7;color:#92400e}.empty{padding:28px;text-align:center;color:var(--muted);background:#f8fafc;border-radius:12px}.logbox{background:#0f172a;color:#dbeafe;border-radius:14px;padding:14px;min-height:220px;max-height:420px;overflow:auto;font-family:"SFMono-Regular",Consolas,monospace;font-size:12px;line-height:1.55;white-space:pre-wrap}.detail{background:#f8fafc;border:1px solid var(--line);border-radius:14px;padding:14px;white-space:pre-wrap;max-height:520px;overflow:auto;font-family:"SFMono-Regular",Consolas,monospace;font-size:12px;line-height:1.55}.small{font-size:12px;color:var(--muted)}@media(max-width:900px){.grid,.form-grid,.cols{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}.container{padding:14px}}
+  </style>
+</head>
+<body>
+<header>
+  <div class="top">
+    <div class="brand">
+      <h1>⚕ Hermes 协同引擎管理面板</h1>
+      <p>用于监控任务拆解、执行器运行、超时重试、日志和自学习经验。</p>
+    </div>
+    <div class="live" id="live">正在连接实时状态...</div>
+  </div>
+</header>
+
+<div class="container">
+  <div class="grid">
+    <div class="card metric"><div><div class="num" id="runs">-</div><div class="name">总运行次数</div></div><div class="icon">📦</div></div>
+    <div class="card metric"><div><div class="num" id="running">-</div><div class="name">正在运行</div></div><div class="icon">⚙️</div></div>
+    <div class="card metric"><div><div class="num" id="workers">-</div><div class="name">运行中执行器</div></div><div class="icon">🤖</div></div>
+    <div class="card metric"><div><div class="num" id="lessons">-</div><div class="name">学习经验</div></div><div class="icon">🧠</div></div>
+  </div>
+
+  <div class="card">
+    <div class="section-title">
+      <div>
+        <h2>启动协同任务</h2>
+        <p>输入一个目标，系统会自动判断复杂度；复杂任务会拆成工作分解节点，并行分发给 Claude Code 执行器。超时任务会自动拆成更小的分片重试。</p>
+      </div>
+    </div>
+    <div class="field">
+      <label for="request">任务目标</label>
+      <textarea id="request" placeholder="例如：阅读 /root/im-bridge/docs/hermes-framework 的设计文档，重新设计并实现一个独立协同引擎，要求支持工作分解、SQLite 持久化、执行器监控和管理面板。"></textarea>
+      <div class="hint">请尽量写清楚目标、约束、参考路径和期望交付物。</div>
+    </div>
+    <div class="form-grid" style="margin-top:14px">
+      <div class="field"><label for="concurrency">并行执行器数量</label><input id="concurrency" type="number" min="1" max="16" value="4" placeholder="例如：4"/><div class="hint">同时运行的 Claude Code 执行器数量。</div></div>
+      <div class="field"><label for="timeout">单个执行器超时秒数</label><input id="timeout" type="number" min="30" value="900" placeholder="例如：900"/><div class="hint">超过该时间会触发超时守护。</div></div>
+      <div class="field"><label for="max_retries">最大重试轮数</label><input id="max_retries" type="number" min="0" value="2" placeholder="例如：2"/><div class="hint">超时或失败后最多重试/拆分几轮。</div></div>
+      <div class="field"><label for="split_count">超时拆分数量</label><input id="split_count" type="number" min="1" value="4" placeholder="例如：4"/><div class="hint">超时任务会拆成多少个聚焦分片。</div></div>
+    </div>
+    <div class="actions">
+      <button class="btn" onclick="startRun()">启动任务</button>
+      <button class="btn secondary" onclick="fillExample()">填入示例</button>
+      <span class="small" id="submitStatus"></span>
+    </div>
+  </div>
+
+  <div class="cols">
+    <div class="card">
+      <div class="section-title"><div><h2>运行记录</h2><p>点击运行编号可查看 WBS 节点、执行器、日志等详细信息。</p></div></div>
+      <div id="runsTable" class="empty">正在加载运行记录...</div>
+    </div>
+    <div class="card">
+      <div class="section-title"><div><h2>运行详情</h2><p>展示选中运行的数据库记录。</p></div></div>
+      <div id="detailBox" class="detail">尚未选择运行。</div>
+    </div>
+  </div>
+
+  <div class="cols">
+    <div class="card"><div class="section-title"><div><h2>实时日志</h2><p>最近的结构化日志，包含任务、节点、执行器和错误信息。</p></div></div><div id="logs" class="logbox">正在加载日志...</div></div>
+    <div class="card"><div class="section-title"><div><h2>自学习经验</h2><p>系统从超时、慢任务和失败中沉淀的经验。</p></div></div><div id="lessonsBox" class="logbox">正在加载经验...</div></div>
+  </div>
+</div>
+
+<script>
+async function getJSON(url){const r=await fetch(url);return await r.json()}
+function esc(s){return String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+function statusText(s){return s==='completed'?'已完成':s==='failed'?'失败':s==='running'?'运行中':s==='planning'?'规划中':s==='created'?'已创建':s}
+function statusClass(s){return s==='completed'?'ok':s==='failed'?'bad':'warn'}
+async function refresh(){
+  try{
+    const o=await getJSON('/api/overview');
+    runs.textContent=o.runs; running.textContent=o.running; workers.textContent=o.workers_running; lessons.textContent=o.lessons;
+    const rs=await getJSON('/api/runs');
+    if(!rs.length){runsTable.innerHTML='<div class="empty">暂无运行记录。</div>'}else{
+      runsTable.innerHTML='<table><tr><th>运行编号</th><th>状态</th><th>标题</th><th>创建时间</th></tr>'+rs.map(r=>`<tr><td><a class="link" href="#" onclick="detail('${r.id}')">${r.id}</a></td><td><span class="tag ${statusClass(r.status)}">${statusText(r.status)}</span></td><td>${esc(r.title)}</td><td>${r.created_at}</td></tr>`).join('')+'</table>';
+    }
+    const lg=await getJSON('/api/logs'); logs.textContent=lg.length?lg.map(l=>`[${l.created_at}] ${l.level} ${l.run_id||''} ${l.node_id||''}\n${l.message}`).join('\n\n'):'暂无日志';
+    const le=await getJSON('/api/lessons'); lessonsBox.textContent=le.length?le.map(l=>`[${l.created_at}] ${l.category}\n${l.lesson}`).join('\n\n'):'暂无学习经验';
+  }catch(e){live.textContent='连接失败';}
+}
+async function detail(id){ const d=await getJSON('/api/runs/'+id); detailBox.textContent=JSON.stringify(d,null,2); }
+async function startRun(){
+  const text=request.value.trim(); if(!text){submitStatus.textContent='请先填写任务目标。'; return;}
+  submitStatus.textContent='正在提交...';
+  await fetch('/api/runs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({request:text,concurrency:+concurrency.value,timeout:+timeout.value,max_retries:+max_retries.value,split_count:+split_count.value,aggregate:true})});
+  request.value=''; submitStatus.textContent='已提交，运行状态会自动刷新。'; refresh();
+}
+function fillExample(){request.value='阅读 /root/im-bridge/docs/hermes-framework 的设计文档，设计一个独立协同引擎，要求自主判断复杂度、WBS 拆解、并行执行器分发、SQLite 持久化、超时拆分重试、自学习经验和管理面板。不要修改 im-bridge。';}
+const es=new EventSource('/api/events');
+es.onmessage=e=>{live.textContent='实时连接正常'; const d=JSON.parse(e.data); runs.textContent=d.overview.runs; running.textContent=d.overview.running; workers.textContent=d.overview.workers_running; lessons.textContent=d.overview.lessons;};
+es.onerror=()=>live.textContent='实时连接重连中';
+refresh(); setInterval(refresh,5000);
+</script>
+</body>
+</html>

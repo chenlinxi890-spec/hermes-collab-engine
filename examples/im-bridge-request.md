@@ -1,0 +1,1 @@
+重新梳理整个协同引擎项目。目标效果：自主判断复杂度，然后进行 WBS 拆解分发，保证并行量、提升效率；持久化采用真实 SQLite；结合官方 Hermes Agent 的工具特点，实现自我学习进化；提供管理面板监控日志、worker 运行状态、任务图、重试和 checkpoint；参考 /root/im-bridge/docs/hermes-framework 的设计文档，但作为独立协同引擎项目实现，不修改 im-bridge。

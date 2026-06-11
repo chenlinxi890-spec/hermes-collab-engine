@@ -1,0 +1,16 @@
+[project]
+name = "hermes-collab-engine"
+version = "0.1.0"
+description = "Standalone collaboration engine for official Hermes Agent and Claude Code workers"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "lpc0387" }]
+dependencies = []
+
+[project.scripts]
+hermes-collab = "src.hermes_collab_engine.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

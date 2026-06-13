@@ -1,0 +1,11 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.example.com",
+    "ANTHROPIC_API_KEY": "replace-with-your-api-key",
+    "ANTHROPIC_MODEL": "replace-with-your-model"
+  },
+  "permissions": {
+    "allow": [],
+    "deny": []
+  }
+}

@@ -4,30 +4,108 @@ set -euo pipefail
 INSTALL_DIR="${INSTALL_DIR:-$HOME/hermes-collab-engine}"
 REPO_URL="${REPO_URL:-https://github.com/lpc0387/hermes-collab-engine.git}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
+VENV_DIR="${VENV_DIR:-$INSTALL_DIR/.venv}"
 
+missing=0
 need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || { echo "缺少依赖: $1" >&2; return 1; }
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "缺少依赖: $1" >&2
+    missing=1
+  fi
+}
+
+print_dependency_help() {
+  cat >&2 <<'HELP'
+请先安装缺失依赖后重试。本脚本不会自动修改系统包管理器。
+常见安装命令：
+  Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y git curl python3 python3-venv
+  Fedora/RHEL:   sudo dnf install -y git curl python3
+  macOS:         xcode-select --install 或 brew install git curl python3
+HELP
+}
+
+write_template_skeletons() {
+  mkdir -p \
+    "$INSTALL_DIR/data" \
+    "$INSTALL_DIR/templates/hermes/skills" \
+    "$INSTALL_DIR/templates/hermes/memories" \
+    "$INSTALL_DIR/templates/claude"
+
+  : > "$INSTALL_DIR/templates/hermes/skills/.gitkeep"
+  : > "$INSTALL_DIR/templates/hermes/memories/.gitkeep"
+
+  if [ ! -f "$INSTALL_DIR/templates/claude/settings.example.json" ]; then
+    cat > "$INSTALL_DIR/templates/claude/settings.example.json" <<'JSON'
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.example.com",
+    "ANTHROPIC_API_KEY": "replace-with-your-api-key",
+    "ANTHROPIC_MODEL": "replace-with-your-model"
+  },
+  "permissions": {
+    "allow": [],
+    "deny": []
+  }
+}
+JSON
+  fi
+}
+
+resolve_path() {
+  python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' "$1"
+}
+
+reject_unsafe_path() {
+  label="$1"
+  value="$2"
+  resolved="$(resolve_path "$value")"
+  home_resolved="$(resolve_path "$HOME")"
+  if [ -z "$value" ] || [ "$resolved" = "/" ] || [ "$resolved" = "$home_resolved" ]; then
+    echo "不安全的 ${label}: $value" >&2
+    exit 1
+  fi
+  printf '%s\n' "$resolved"
+}
+
+write_launcher() {
+  target="$1"
+  shift
+  printf -v quoted_install_dir '%q' "$INSTALL_DIR"
+  printf -v quoted_python_bin '%q' "$PYTHON_BIN"
+  quoted_args=""
+  for arg in "$@"; do
+    printf -v quoted_arg '%q' "$arg"
+    quoted_args="${quoted_args} ${quoted_arg}"
+  done
+  cat > "$target" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+cd $quoted_install_dir
+exec $quoted_python_bin$quoted_args "\$@"
+EOF
+  chmod +x "$target"
 }
 
 echo "==> 检查基础依赖"
 need_cmd git
 need_cmd python3
-need_cmd bash
-
-if ! command -v claude >/dev/null 2>&1; then
-  echo "未找到 Claude Code CLI: claude"
-  echo "请先安装并登录 Claude Code，然后重新运行本脚本。"
-  echo "参考: https://docs.anthropic.com/en/docs/claude-code"
+need_cmd curl
+if [ "$missing" -ne 0 ]; then
+  print_dependency_help
   exit 1
 fi
 
-if ! command -v hermes >/dev/null 2>&1; then
-  echo "未找到官方 Hermes Agent: hermes"
-  echo "将尝试安装官方 NousResearch Hermes Agent。"
-  curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-fi
+INSTALL_DIR="$(reject_unsafe_path INSTALL_DIR "$INSTALL_DIR")"
+BIN_DIR="$(reject_unsafe_path BIN_DIR "$BIN_DIR")"
+VENV_DIR="$(reject_unsafe_path VENV_DIR "$VENV_DIR")"
 
 mkdir -p "$BIN_DIR"
+
+if [ -e "$INSTALL_DIR" ] && [ ! -d "$INSTALL_DIR/.git" ]; then
+  echo "安装目录已存在但不是 Git 仓库: $INSTALL_DIR" >&2
+  echo "请设置 INSTALL_DIR 到空目录，或手动处理该目录后重试。" >&2
+  exit 1
+fi
 
 if [ -d "$INSTALL_DIR/.git" ]; then
   echo "==> 更新已有仓库: $INSTALL_DIR"
@@ -37,16 +115,46 @@ else
   git clone "$REPO_URL" "$INSTALL_DIR"
 fi
 
-chmod +x "$INSTALL_DIR/hermes-collab" "$INSTALL_DIR/start.sh" "$INSTALL_DIR/start.py"
-ln -sf "$INSTALL_DIR/hermes-collab" "$BIN_DIR/hermes-collab"
-ln -sf "$INSTALL_DIR/start.sh" "$BIN_DIR/opc"
+echo "==> 创建空模板目录"
+write_template_skeletons
 
-mkdir -p "$INSTALL_DIR/data"
+echo "==> 安装 Python 包"
+if python3 -m venv "$VENV_DIR" >/dev/null 2>&1; then
+  "$VENV_DIR/bin/python" -m pip install --upgrade pip
+  "$VENV_DIR/bin/python" -m pip install -e "$INSTALL_DIR"
+  PYTHON_BIN="$VENV_DIR/bin/python"
+else
+  echo "无法创建虚拟环境: $VENV_DIR" >&2
+  echo "请安装 python3-venv，或手动运行: python3 -m pip install --user -e '$INSTALL_DIR'" >&2
+  PYTHON_BIN="$(command -v python3)"
+fi
 
+chmod +x "$INSTALL_DIR/start.py"
+write_launcher "$BIN_DIR/hermes-collab" -m src.hermes_collab_engine.cli
+write_launcher "$BIN_DIR/opc" start.py
+
+if ! command -v claude >/dev/null 2>&1; then
+  echo ""
+  echo "提示: 未找到 Claude Code CLI: claude"
+  echo "如需使用 claude-code worker，请先安装并登录 Claude Code:"
+  echo "  https://docs.anthropic.com/en/docs/claude-code"
+fi
+
+if ! command -v hermes >/dev/null 2>&1; then
+  echo ""
+  echo "提示: 未找到 Hermes CLI: hermes"
+  echo "本脚本不会自动执行远程安装脚本；如需 launcher 模式，请按官方文档安装 Hermes。"
+fi
+
+echo ""
 echo "==> 安装完成"
+echo "仓库: $INSTALL_DIR"
+echo "Python: $PYTHON_BIN"
+echo "模板: $INSTALL_DIR/templates"
 echo "命令:"
-echo "  opc                  # 选择模型并启动面板，然后进入 Hermes 命令行"
-echo "  hermes-collab --help # 查看协同引擎 CLI"
+echo "  $BIN_DIR/opc                  # 选择模型并启动面板，然后进入 Hermes 命令行"
+echo "  $BIN_DIR/hermes-collab --help # 查看协同引擎 CLI"
+echo "  cd '$INSTALL_DIR' && ./scripts/install-hermes-integration.sh --target-dir ./tmp/hermes-template"
 echo ""
 echo "如果 $BIN_DIR 不在 PATH 中，请执行:"
 echo "  export PATH=\"$BIN_DIR:\$PATH\""

@@ -2,89 +2,137 @@
 set -euo pipefail
 
 ENGINE_DIR="${ENGINE_DIR:-$HOME/hermes-collab-engine}"
-HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-SKILL_DIR="$HERMES_HOME/skills/hermes-claude-collab"
-MEMORY_DIR="$HERMES_HOME/memories"
-SOUL_FILE="$HERMES_HOME/SOUL.md"
+TARGET_DIR="${HERMES_HOME:-$HOME/.hermes}"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
+DRY_RUN=0
 
-mkdir -p "$SKILL_DIR" "$MEMORY_DIR" "$BIN_DIR"
+usage() {
+  cat <<'USAGE'
+Usage: scripts/install-hermes-integration.sh [--target-dir DIR] [--bin-dir DIR] [--dry-run]
 
-ln -sf "$ENGINE_DIR/hermes-collab" "$BIN_DIR/hermes-collab"
-ln -sf "$ENGINE_DIR/start.sh" "$BIN_DIR/opc"
+Creates a conservative Hermes integration skeleton:
+  DIR/skills/hermes-claude-collab/SKILL.example.md
+  DIR/memories/COLLAB_ENGINE_CAPABILITY.example.md
 
-cat > "$SKILL_DIR/SKILL.md" <<'SKILL'
----
+The files are templates only. No tokens are written and no existing Hermes files are read.
+USAGE
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --target-dir)
+      TARGET_DIR="${2:?missing value for --target-dir}"
+      shift 2
+      ;;
+    --bin-dir)
+      BIN_DIR="${2:?missing value for --bin-dir}"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+resolve_path() {
+  python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' "$1"
+}
+
+reject_unsafe_path() {
+  label="$1"
+  value="$2"
+  resolved="$(resolve_path "$value")"
+  home_resolved="$(resolve_path "$HOME")"
+  if [ -z "$value" ] || [ "$resolved" = "/" ] || [ "$resolved" = "$home_resolved" ]; then
+    echo "Unsafe ${label}: $value" >&2
+    exit 1
+  fi
+  printf '%s\n' "$resolved"
+}
+
+ENGINE_DIR="$(reject_unsafe_path ENGINE_DIR "$ENGINE_DIR")"
+TARGET_DIR="$(reject_unsafe_path TARGET_DIR "$TARGET_DIR")"
+BIN_DIR="$(reject_unsafe_path BIN_DIR "$BIN_DIR")"
+
+SKILL_DIR="$TARGET_DIR/skills/hermes-claude-collab"
+MEMORY_DIR="$TARGET_DIR/memories"
+SKILL_FILE="$SKILL_DIR/SKILL.example.md"
+MEMORY_FILE="$MEMORY_DIR/COLLAB_ENGINE_CAPABILITY.example.md"
+
+write_file_if_missing() {
+  path="$1"
+  content="$2"
+  if [ -f "$path" ]; then
+    echo "保留已有文件: $path"
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "将创建: $path"
+    return 0
+  fi
+  printf '%s\n' "$content" > "$path"
+}
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "Dry run: no files will be written."
+  echo "Target: $TARGET_DIR"
+  echo "Bin dir: $BIN_DIR"
+else
+  mkdir -p "$SKILL_DIR" "$MEMORY_DIR" "$BIN_DIR"
+fi
+
+write_file_if_missing "$SKILL_FILE" '---
 name: hermes-claude-collab
-description: Default capability for substantive tasks: use the local Hermes Collab Engine to plan, split, dispatch Claude Code workers, supervise timeouts, and aggregate results.
+description: Template skill for connecting Hermes to a local Hermes Collab Engine checkout.
 version: 1.0.0
-platforms: [linux]
-metadata:
-  hermes:
-    tags: [claude-code, orchestration, multi-agent, terminal, coding]
-    category: software-development
-    requires_toolsets: [terminal]
 ---
 
-# Hermes Collaboration Engine
+# Hermes Collab Engine integration template
 
-## When to Use
+Replace this example with your local policy before enabling it as SKILL.md.
 
-Use this skill by default for substantive tasks: implementation, repository analysis, debugging, audits, research, planning, multi-step work, long-running work, or anything that benefits from parallel Claude Code workers. Only skip it for simple chat, tiny questions, or obvious single-step answers.
-
-## Required Behavior
-
-Hermes has a local collaboration engine available at:
+Suggested command template:
 
 ```bash
-~/hermes-collab-engine/hermes-collab
+~/hermes-collab-engine/hermes-collab run "<task>" --cwd "<working-directory>" --json
 ```
 
-For substantive tasks, call it through the terminal tool with bounded concurrency, timeout supervision, shard splitting, retries, SQLite persistence, and aggregation.
+Security notes:
 
-Recommended command:
+- Do not paste API keys or tokens into this skill.
+- Keep project-specific secrets in your normal secret manager or environment.
+- Review tool permissions before enabling automated worker execution.'
 
-```bash
-~/hermes-collab-engine/hermes-collab run "<task>" --cwd "<working-directory>" --concurrency 4 --timeout 900 --max-retries 2 --split-count 4 --json
-```
+write_file_if_missing "$MEMORY_FILE" '# Collaboration engine capability template
 
-For large tasks, write the request to a file and use `--request-file`.
+This is an empty skeleton memory. Copy it to a real memory file only after reviewing the behavior you want Hermes to remember.
 
-If a worker times out, treat it as a decomposition signal. Split, re-dispatch shards, aggregate, and report parent/shard outcomes honestly.
-SKILL
+Suggested non-secret fact:
 
-cat > "$MEMORY_DIR/COLLAB_ENGINE_CAPABILITY.md" <<'MEMORY'
-# Collaboration engine capability
+- A local Hermes Collab Engine checkout may be available at `~/hermes-collab-engine`.
 
-Hermes has a local collaboration engine available at `~/hermes-collab-engine/hermes-collab`.
+Do not store API keys, auth tokens, session data, logs, or private project memory in this template.'
 
-Default behavior:
-
-- For substantive task requests — implementation, repository analysis, debugging, audits, research, planning, multi-step work, long-running work, or anything that benefits from parallel Claude Code workers — Hermes should use the collaboration engine by default via the terminal tool.
-- Only handle directly when the request is simple chat, a very small question, or an obviously single-step answer.
-- Use the collaboration engine with checkpointing, timeout supervision, shard splitting, retries, and aggregation.
-
-Recommended command template:
-
-```bash
-~/hermes-collab-engine/hermes-collab run "<task>" --cwd "<working-directory>" --concurrency 4 --timeout 900 --max-retries 2 --split-count 4 --json
-```
-MEMORY
-
-mkdir -p "$HERMES_HOME"
-if [ ! -f "$SOUL_FILE" ]; then
-  echo "You are Hermes Agent, an intelligent AI assistant." > "$SOUL_FILE"
+if [ -x "$ENGINE_DIR/hermes-collab" ] && [ "$DRY_RUN" -eq 0 ]; then
+  ln -sf "$ENGINE_DIR/hermes-collab" "$BIN_DIR/hermes-collab"
 fi
-if ! grep -q "hermes-collab-engine/hermes-collab" "$SOUL_FILE"; then
-  cat >> "$SOUL_FILE" <<'SOUL'
-
-You have a local collaboration engine available at `~/hermes-collab-engine/hermes-collab`. For substantive task requests — implementation, repo analysis, debugging, audits, research, planning, multi-step work, long-running tasks, or anything that benefits from parallel Claude Code workers — default to using this collaboration engine through the terminal tool instead of trying to do everything in one Hermes turn. Simple chat, very small questions, or single-step answers can be handled directly.
-
-When using the collaboration engine, supervise the run. Do not treat worker launches as fire-and-forget. Use checkpointing, timeout splitting, retry shards, and aggregation by default. If a Claude Code worker times out, decompose the timed-out work into smaller focused shards, re-dispatch them, and aggregate the successful parent/shard results. Report parent timeouts and shard outcomes honestly.
-SOUL
+if [ -x "$ENGINE_DIR/start.sh" ] && [ "$DRY_RUN" -eq 0 ]; then
+  ln -sf "$ENGINE_DIR/start.sh" "$BIN_DIR/opc"
 fi
 
-echo "Hermes integration installed."
-echo "Skill: $SKILL_DIR/SKILL.md"
-echo "Memory: $MEMORY_DIR/COLLAB_ENGINE_CAPABILITY.md"
-echo "Command: $BIN_DIR/opc"
+echo "Hermes integration skeleton ready."
+echo "Skill template: $SKILL_FILE"
+echo "Memory template: $MEMORY_FILE"
+echo ""
+echo "To enable, inspect the example files, then copy/rename them without the .example suffix."
+echo "No secrets were created or copied."

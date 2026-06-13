@@ -1,4 +1,7 @@
 # Runtime data
+/data/sandbox_workspace/
+/sandbox_workspace/
+/data/sandbox_real.sqlite3*
 /data/*.sqlite3
 /data/*.sqlite3-*
 /data/*.db

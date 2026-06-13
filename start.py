@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parent
 HERMES_DIR = Path.home() / '.hermes'
 CLAUDE_DIR = Path.home() / '.claude'
 
-VERSION = 'v4.5'
+VERSION = 'v5.0'
 GITHUB_URL = 'https://github.com/lpc0387/hermes-collab-engine'
 TAGLINE_ZH = '多 Agent 协同引擎 · Leader 拆解 · Worker 并行 · 面板可视化'
 TAGLINE_EN = 'Multi-agent collab engine · Leader plans · Workers run in parallel · Live dashboard'

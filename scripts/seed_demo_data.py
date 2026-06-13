@@ -35,7 +35,7 @@ RUNS = [
     },
     {
         "id": "demo_run_success",
-        "title": "Demo: v4.5 capability preview verified",
+        "title": "Demo: v5.0 capability preview verified",
         "request": "验证 Skill/Tool 预览、Worker 池、运行日志和历史记录展示。",
         "status": "completed",
         "complexity": {"domain": 5, "steps": 4, "ambiguity": 2, "coupling": 5, "risk": 3, "overall": 4, "routing": "single"},

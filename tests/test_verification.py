@@ -1,4 +1,4 @@
-"""Tests for v4.5 local verification reporting."""
+"""Tests for release verification reporting."""
 from __future__ import annotations
 
 import json
@@ -21,18 +21,27 @@ class VerificationReportTests(unittest.TestCase):
         self.assertTrue(report.skipped)
 
     def test_verify_v45_cli_outputs_json_report(self):
+        data = self._run_verification_cli("verify-v45")
+        self.assertEqual(data["status"], "ok")
+        self.assertGreaterEqual(len(data["checks"]), 5)
+        self.assertTrue(data["skipped"])
+
+    def test_verify_release_cli_alias_outputs_json_report(self):
+        data = self._run_verification_cli("verify-release")
+        self.assertEqual(data["status"], "ok")
+        self.assertGreaterEqual(len(data["checks"]), 5)
+        self.assertTrue(data["skipped"])
+
+    def _run_verification_cli(self, command):
         proc = subprocess.run(
-            ["python3", "-m", "hermes_collab_engine.cli", "verify-v45", "--json"],
+            ["python3", "-m", "hermes_collab_engine.cli", command, "--json"],
             capture_output=True,
             text=True,
             cwd="/root/hermes-collab-engine/src",
             env={**os.environ, "PYTHONPATH": "/root/hermes-collab-engine/src"},
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        data = json.loads(proc.stdout)
-        self.assertEqual(data["status"], "ok")
-        self.assertGreaterEqual(len(data["checks"]), 5)
-        self.assertTrue(data["skipped"])
+        return json.loads(proc.stdout)
 
 
 if __name__ == "__main__":

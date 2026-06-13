@@ -1,6 +1,6 @@
 # Hermes dashboard sandbox
 
-This directory hosts the release demo sandbox for Hermes Collab Engine v4.5. It runs a real local dashboard server with mock API data, an isolated SQLite demo database, and an isolated workspace; it does **not** bundle runtime data, secrets, or real Hermes/Claude configuration.
+This directory hosts the release demo sandbox for Hermes Collab Engine v5.0. It runs a real local dashboard server with mock API data, an isolated SQLite demo database, and an isolated workspace; it does **not** bundle runtime data, secrets, or real Hermes/Claude configuration.
 
 ## Quick start
 

@@ -1,10 +1,16 @@
-# Hermes Collab Engine v4.5
+# Hermes Collab Engine v5.0
 
-Hermes Collab Engine v4.5 は Hermes 協調ワークフロー向けの **AI multi-agent collaboration engine** です。Leader が要求を **WBS** ノードへ分解し、Worker が並列実行し、**Claude Code** / **Hermes Agent** / カスタム Agent Backend を同じパイプラインに接続できます。
+[![Release v5.0.0](https://img.shields.io/badge/release-v5.0.0-blue)](CHANGELOG.md) [![Sandbox ready](https://img.shields.io/badge/sandbox-ready-success)](sandbox/README.md) [![License MIT](https://img.shields.io/badge/license-MIT-green)](#ライセンス) [![Security](https://img.shields.io/badge/security-policy-orange)](SECURITY.md)
+
+Hermes Collab Engine v5.0 は Hermes 協調ワークフロー向け **AI multi-agent collaboration engine** の初の正式公開リリースです。Leader が要求を **WBS** ノードへ分解し、Worker が並列実行し、**Claude Code** / **Hermes Agent** / カスタム Agent Backend を同じパイプラインに接続できます。
 
 リアルタイム **dashboard**、隔離された **sandbox**、Leader フィードバック日記、軽量 API、**one-line install** を備え、複雑な開発タスクの分解・配布・監査・要約に使えます。
 
 ![ピクセル協調オフィス ダッシュボード](docs/screenshots/dashboard.png)
+
+## リリースとコミュニティ
+
+このプロジェクトが役立つ場合は、GitHub star で v5.0 リリースラインをフォローしてください。コントリビュート前に [`CONTRIBUTING.md`](CONTRIBUTING.md) を確認し、セキュリティ問題は [`SECURITY.md`](SECURITY.md) から報告し、計画は [`ROADMAP.md`](ROADMAP.md)、変更履歴は [`CHANGELOG.md`](CHANGELOG.md) を参照してください。
 
 ## ワンラインデプロイ
 
@@ -133,7 +139,7 @@ hermes-collab log <run_id> <node_id> "msg"  # ログに書き込み
 ### 検証
 
 ```bash
-hermes-collab verify-v45    # v4.5 機能の完全性チェック
+hermes-collab verify-release # v5.0 リリース完全性チェック
 ```
 
 ## API
@@ -209,7 +215,7 @@ src/hermes_collab_engine/
 ├── skills.py        # Skill 配信
 ├── tools.py         # MCP ツール管理
 ├── agents/          # Agent Backend 抽象化
-├── verification.py  # v4.5 完全性チェック
+├── verification.py  # v5.0 リリース完全性チェック
 └── ...
 web/
 └── index.html       # 可視化 dashboard

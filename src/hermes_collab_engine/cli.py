@@ -206,8 +206,11 @@ def main() -> int:
     tools_cmd.add_argument("--task", default="", help="Task text used with --node-type selection")
     tools_cmd.add_argument("--json", action="store_true")
 
-    verify_v45 = sub.add_parser("verify-v45", help="Run local checks for v4.5 skill/tool/dashboard features")
+    verify_v45 = sub.add_parser("verify-v45", help="Legacy alias for verify-release")
     verify_v45.add_argument("--json", action="store_true")
+
+    verify_release = sub.add_parser("verify-release", help="Run current release verification checks")
+    verify_release.add_argument("--json", action="store_true")
 
     redo_node = sub.add_parser("redo-node", help="Create a redo node while keeping the source node for audit")
     redo_node.add_argument("--db", default="data/collab.sqlite3")
@@ -322,14 +325,15 @@ def main() -> int:
                 print(f"  {profile.name:22s} p{profile.priority} {profile.category:12s}{mcp:4s} [{node_types}] {profile.display_name}")
         return 0
 
-    if args.cmd == "verify-v45":
+    if args.cmd in {"verify-v45", "verify-release"}:
         from .verification import verify_v45_capabilities
         report = verify_v45_capabilities()
         data = report.to_dict()
         if args.json:
             print(json.dumps(data, ensure_ascii=False, indent=2))
         else:
-            print(f"v4.5 verification: {report.status}")
+            label = "release" if args.cmd == "verify-release" else "release (legacy verify-v45 alias)"
+            print(f"{label} verification: {report.status}")
             for check in report.checks:
                 marker = "✓" if check.status == "passed" else "✗"
                 print(f"  {marker} {check.name}: {check.detail}")

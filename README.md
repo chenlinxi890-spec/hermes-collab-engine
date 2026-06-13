@@ -1,10 +1,16 @@
-# Hermes Collab Engine v4.5
+# Hermes Collab Engine v5.0
 
-Hermes Collab Engine v4.5 是面向 **Hermes 协同引擎** 的 **AI multi-agent collaboration engine**：Leader 把需求拆成 WBS，Worker 并行执行，Claude Code / Hermes Agent / 自定义 Agent Backend 可接入同一条协作流水线。
+[![Release v5.0.0](https://img.shields.io/badge/release-v5.0.0-blue)](CHANGELOG.md) [![Sandbox ready](https://img.shields.io/badge/sandbox-ready-success)](sandbox/README.md) [![License MIT](https://img.shields.io/badge/license-MIT-green)](#许可证) [![Security](https://img.shields.io/badge/security-policy-orange)](SECURITY.md)
+
+Hermes Collab Engine v5.0 是面向 **Hermes 协同引擎** 的首个正式公开发布版 **AI multi-agent collaboration engine**：Leader 把需求拆成 WBS，Worker 并行执行，Claude Code / Hermes Agent / 自定义 Agent Backend 可接入同一条协作流水线。
 
 它同时提供实时 **dashboard**、隔离 **sandbox**、Leader 反馈日记本、轻量 API 与一行安装部署，适合把复杂研发任务拆解、调度、审计并汇总成可读交付物。
 
 ![像素协同工位仪表盘](docs/screenshots/dashboard.png)
+
+## 发布与社区
+
+如果这个项目对你有帮助，欢迎在 GitHub star 关注 v5.0 发布线。参与前请阅读 [`CONTRIBUTING.md`](CONTRIBUTING.md)，安全问题请走 [`SECURITY.md`](SECURITY.md)，路线图见 [`ROADMAP.md`](ROADMAP.md)，版本变化见 [`CHANGELOG.md`](CHANGELOG.md)。
 
 ## 一行部署
 
@@ -133,7 +139,7 @@ hermes-collab log <run_id> <node_id> "msg"  # 写入日志
 ### 验证
 
 ```bash
-hermes-collab verify-v45    # v4.5 功能完整性检查
+hermes-collab verify-release # v5.0 发布完整性检查
 ```
 
 ## API
@@ -209,7 +215,7 @@ src/hermes_collab_engine/
 ├── skills.py        # Skill 分发
 ├── tools.py         # MCP 工具管理
 ├── agents/          # Agent Backend 抽象
-├── verification.py  # v4.5 完整性检查
+├── verification.py  # v5.0 发布完整性检查
 └── ...
 web/
 └── index.html       # 可视化面板

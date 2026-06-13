@@ -1,10 +1,16 @@
-# Hermes Collab Engine v4.5
+# Hermes Collab Engine v5.0
 
-Hermes Collab Engine v4.5 is an **AI multi-agent collaboration engine** for the Hermes collaboration workflow: a Leader decomposes requests into **WBS** nodes, Workers run in parallel, and **Claude Code** / **Hermes Agent** / custom Agent Backends can join the same pipeline.
+[![Release v5.0.0](https://img.shields.io/badge/release-v5.0.0-blue)](CHANGELOG.md) [![Sandbox ready](https://img.shields.io/badge/sandbox-ready-success)](sandbox/README.md) [![License MIT](https://img.shields.io/badge/license-MIT-green)](#license) [![Security](https://img.shields.io/badge/security-policy-orange)](SECURITY.md)
+
+Hermes Collab Engine v5.0 is the first formal public release of the **AI multi-agent collaboration engine** for the Hermes collaboration workflow: a Leader decomposes requests into **WBS** nodes, Workers run in parallel, and **Claude Code** / **Hermes Agent** / custom Agent Backends can join the same pipeline.
 
 It ships with a real-time **dashboard**, isolated **sandbox**, Leader feedback diary, lightweight API, and **one-line install** path for decomposing, dispatching, auditing, and summarizing complex engineering work.
 
 ![Pixel Collab Office Dashboard](docs/screenshots/dashboard.png)
+
+## Release and community
+
+If this project helps you, please star it on GitHub to follow the v5.0 release line. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before contributing, report security issues through [`SECURITY.md`](SECURITY.md), follow plans in [`ROADMAP.md`](ROADMAP.md), and review changes in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## One-line deployment
 
@@ -133,7 +139,7 @@ hermes-collab log <run_id> <node_id> "msg"  # Write a log entry
 ### Verification
 
 ```bash
-hermes-collab verify-v45    # v4.5 feature completeness check
+hermes-collab verify-release # v5.0 release completeness check
 ```
 
 ## API
@@ -209,7 +215,7 @@ src/hermes_collab_engine/
 ├── skills.py        # Skill distribution
 ├── tools.py         # MCP tool management
 ├── agents/          # Agent Backend abstraction
-├── verification.py  # v4.5 completeness check
+├── verification.py  # v5.0 release completeness check
 └── ...
 web/
 └── index.html       # Visualization dashboard

@@ -1,4 +1,4 @@
-"""Local verification helpers for v4.5 capabilities."""
+"""Local verification helpers for the current public release."""
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
@@ -29,7 +29,11 @@ class VerificationReport:
 
 
 def verify_v45_capabilities() -> VerificationReport:
-    """Verify v4.5 registries and dashboard metadata without launching workers."""
+    """Verify release registries and dashboard metadata without launching workers.
+
+    The function name is kept for backwards-compatible callers that used the
+    pre-v5.0 ``verify-v45`` command.
+    """
     from .server import DashboardServer, INDEX_HTML
     from .skills import get_default_registry
     from .tools import get_default_tool_registry

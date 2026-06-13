@@ -14,6 +14,14 @@ It ships with a real-time **dashboard**, isolated **sandbox**, Leader feedback d
 
 If this project helps you, please star it on GitHub to follow the v5.0 release line. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before contributing, report security issues through [`SECURITY.md`](SECURITY.md), follow plans in [`ROADMAP.md`](ROADMAP.md), and review changes in [`CHANGELOG.md`](CHANGELOG.md). Optional community launch copy lives in [`docs/launch/v5.0-posts.md`](docs/launch/v5.0-posts.md).
 
+## Contact and support
+
+WeChat: `lg19961117`
+
+If the project helps you, optional sponsorship is welcome:
+
+![Sponsor QR code](docs/assets/money.png)
+
 ## One-line deployment
 
 ```bash

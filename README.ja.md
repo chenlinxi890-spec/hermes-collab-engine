@@ -14,6 +14,14 @@ Hermes Collab Engine v5.0 は Hermes 協調ワークフロー向け **AI multi-a
 
 このプロジェクトが役立つ場合は、GitHub star で v5.0 リリースラインをフォローしてください。コントリビュート前に [`CONTRIBUTING.md`](CONTRIBUTING.md) を確認し、セキュリティ問題は [`SECURITY.md`](SECURITY.md) から報告し、計画は [`ROADMAP.md`](ROADMAP.md)、変更履歴は [`CHANGELOG.md`](CHANGELOG.md) を参照してください。コミュニティ共有文面は必要に応じて [`docs/launch/v5.0-posts.md`](docs/launch/v5.0-posts.md) を参照できます。
 
+## 連絡とサポート
+
+WeChat：`lg19961117`
+
+プロジェクトが役立つ場合は、任意の支援も歓迎します：
+
+![支援用QRコード](docs/assets/money.png)
+
 ## ワンラインデプロイ
 
 ```bash

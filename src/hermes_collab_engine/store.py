@@ -11,7 +11,7 @@ from .models import RiskPolicy
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY,title TEXT NOT NULL,request TEXT NOT NULL,status TEXT NOT NULL,complexity_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,completed_at TEXT);
-CREATE TABLE IF NOT EXISTS wbs_nodes (id TEXT PRIMARY KEY,run_id TEXT NOT NULL,parent_id TEXT,title TEXT NOT NULL,description TEXT NOT NULL,capability TEXT NOT NULL,complexity INTEGER NOT NULL,dependencies_json TEXT NOT NULL DEFAULT '[]',parallelizable INTEGER NOT NULL DEFAULT 1,deliverable TEXT NOT NULL,status TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,checkpoint INTEGER NOT NULL DEFAULT 0,result TEXT,session_id TEXT,duration_seconds REAL,error TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(run_id) REFERENCES runs(id));
+CREATE TABLE IF NOT EXISTS wbs_nodes (id TEXT NOT NULL,run_id TEXT NOT NULL,parent_id TEXT,title TEXT NOT NULL,description TEXT NOT NULL,capability TEXT NOT NULL,complexity INTEGER NOT NULL,dependencies_json TEXT NOT NULL DEFAULT '[]',parallelizable INTEGER NOT NULL DEFAULT 1,deliverable TEXT NOT NULL,status TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,checkpoint INTEGER NOT NULL DEFAULT 0,result TEXT,session_id TEXT,duration_seconds REAL,error TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY (id, run_id),FOREIGN KEY(run_id) REFERENCES runs(id));
 CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY,run_id TEXT NOT NULL,node_id TEXT,status TEXT NOT NULL,started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,duration_seconds REAL,session_id TEXT,error TEXT);
 CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT,node_id TEXT,level TEXT NOT NULL,message TEXT NOT NULL,data_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS lessons (id INTEGER PRIMARY KEY AUTOINCREMENT,scope TEXT NOT NULL DEFAULT 'global',category TEXT NOT NULL,lesson TEXT NOT NULL,evidence_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
@@ -30,6 +30,19 @@ class CollabStore:
         self.lock = threading.RLock()
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # Record engine start timestamp so _cleanup_stale_workers can
+        # distinguish "this incarnation's runs" from "previous incarnation's runs".
+        # CRITICAL: format MUST match SQLite CURRENT_TIMESTAMP ('YYYY-MM-DD HH:MM:SS')
+        # so string comparison is correct. Previous ISO format (with 'T' + 'Z')
+        # was lexicographically GREATER than space-separator SQLite timestamps.
+        import datetime
+        now = datetime.datetime.utcnow()
+        self._engine_start_ts = now.strftime("%Y-%m-%d %H:%M:%S")
+        # Also keep a window (5s) for clock skew between cleanup check and insert
+        import time as _time
+        self._engine_start_ts_with_skew = now.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )  # use strict equality with created_at (no skew window)
         with self.lock:
             self.conn.executescript(SCHEMA)
             self._ensure_schema()
@@ -63,9 +76,12 @@ class CollabStore:
         )
         # Case 2: workers whose parent run is still 'running' — previous engine crashed.
         # These runs may have pending/running nodes that also need cleanup.
+        # CRITICAL: filter by created_at < engine start ts so we never touch
+        # runs created by THIS incarnation (avoids race with newly spawned run CLIs).
         stale_run_ids = [
             row["id"] for row in self._query(
-                "SELECT id FROM runs WHERE status = 'running'"
+                "SELECT id FROM runs WHERE status='running' AND created_at < ?",
+                (self._engine_start_ts,)
             )
         ]
         if stale_run_ids:
@@ -88,12 +104,13 @@ class CollabStore:
                      AND run_id IN ({placeholders})""",
                 tuple(stale_run_ids),
             )
-            # Finally mark the runs themselves as failed
+            # Finally mark the runs themselves as failed (SCOPED to stale_run_ids)
             self._execute(
-                """UPDATE runs SET status='failed',
+                f"""UPDATE runs SET status='failed',
                    updated_at=CURRENT_TIMESTAMP,
                    completed_at=CURRENT_TIMESTAMP
-                   WHERE status='running'"""
+                   WHERE id IN ({placeholders})""",
+                tuple(stale_run_ids),
             )
         # Case 3: orphaned pending nodes in terminal runs.
         # These are nodes whose dependencies can never be satisfied because
@@ -413,8 +430,10 @@ class CollabStore:
             return self._one(sql)[0]
         return {"runs": scalar("SELECT COUNT(*) FROM runs"), "running": scalar("SELECT COUNT(*) FROM runs WHERE status='running'"), "completed": scalar("SELECT COUNT(*) FROM runs WHERE status='completed'"), "failed": scalar("SELECT COUNT(*) FROM runs WHERE status='failed'"), "workers_running": scalar("SELECT COUNT(*) FROM workers WHERE status='running'"), "lessons": scalar("SELECT COUNT(*) FROM lessons")}
 
-    def list_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_runs(self, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
         columns = "id,title,status,created_at,updated_at,completed_at,agent"
+        if status:
+            return [dict(r) for r in self._query(f"SELECT {columns} FROM runs WHERE status=? ORDER BY created_at DESC LIMIT ?", (status, limit))]
         return [dict(r) for r in self._query(f"SELECT {columns} FROM runs ORDER BY created_at DESC LIMIT ?", (limit,))]
 
     def latest_resumable_run(self) -> dict[str, Any] | None:
@@ -444,8 +463,20 @@ class CollabStore:
             "SELECT snapshot_type,node_id,snapshot_json,created_at FROM context_snapshots WHERE run_id=? ORDER BY id DESC LIMIT ?",
             (rid, min(3, recent_limit)),
         )]
+        # Build a compact summary (first 200 chars of request) so dashboard
+        # resume banner can show something useful without dumping the full task.
+        summary = (run_dict.get("request") or run_dict.get("title") or "")[:200]
+        # Rough token estimate: 1 token ~= 4 chars of compact context.
+        compact_chars = (
+            len(summary)
+            + sum(len(str(x.get("message", ""))) for x in recent_logs)
+            + sum(len(str(x.get("title", ""))) for x in nodes)
+        )
+        estimated_tokens = max(1, compact_chars // 4)
         return {
             "run": run_dict,
+            "summary": summary,
+            "estimated_tokens": estimated_tokens,
             "recent_interactions": list(reversed(recent_logs)),
             "recent_nodes": nodes,
             "context_snapshots": snapshots,

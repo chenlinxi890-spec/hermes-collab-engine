@@ -237,7 +237,7 @@ class EnvModelFallbackTests(unittest.TestCase):
         self.assertEqual(len(aggregate_nodes), 1)
         self.assertEqual(aggregate_nodes[0]["status"], "completed")
         self.assertEqual(aggregate_nodes[0]["result"], "# Final diary")
-        self.assertTrue(any(log["node_id"].endswith("-aggregate") and log["message"] == "worker finished" for log in detail["logs"]))
+        self.assertTrue(any((log.get("node_id") or "").endswith("-aggregate") and log["message"] == "worker finished" for log in detail["logs"]))
 
 
 if __name__ == "__main__":

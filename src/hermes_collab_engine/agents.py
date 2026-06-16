@@ -190,13 +190,81 @@ def _register_builtin(b: AgentBackend) -> None:
 # ``hermes_collab_engine/adapters/`` exposing ``BACKEND``, (2) add its
 # import here. The ``adapters`` subpackage re-exports the public API
 # (``list_adapters`` / ``get_adapter`` / ...) under the new vocabulary.
-from .adapters.claude_code import BACKEND as _CLAUDE_CODE  # noqa: E402
-from .adapters.codex import BACKEND as _CODEX              # noqa: E402
-from .adapters.opencode import BACKEND as _OPENCODE        # noqa: E402
-from .adapters.hermes import BACKEND as _HERMES            # noqa: E402
-
-for _b in (_CLAUDE_CODE, _CODEX, _OPENCODE, _HERMES):
-    _register_builtin(_b)
+# Built-in backends. Originally registered inline in this file; the
+# cc-switch work tried to factor them out into an ``adapters/`` subpackage
+# but the four split files were never committed, so we keep the
+# registrations inline here to avoid the engine breaking on import.
+# If you want to re-introduce the modular split, drop the four files
+# into src/hermes_collab_engine/adapters/ and replace these blocks
+# with ``from .adapters.<name> import BACKEND as _<NAME>``.
+_register_builtin(AgentBackend(
+    name="claude-code",
+    display_name="Claude Code",
+    command=["claude"],
+    prompt_flag="-p",
+    output_format_flags=["--output-format", "json"],
+    supports_model_flag=True,
+    model_flag="--model",
+    permission_flags=["--permission-mode", "auto"],
+    allowed_tools_flag="--allowedTools",
+    output_parser="claude_json",
+    process_pattern="claude.*--output-format",
+    prompt_prefix="You are a Claude Code worker in a Hermes collaboration engine.",
+    prompt_suffix="",
+    default_allowed_tools=["Read", "Edit", "Write", "MultiEdit", "Bash(*)"],
+    capabilities=["file-edit", "git-ops", "test-run", "mcp-host", "search"],
+))
+_register_builtin(AgentBackend(
+    name="codex",
+    display_name="Codex CLI",
+    command=["codex"],
+    prompt_flag="--prompt",
+    output_format_flags=[],
+    supports_model_flag=True,
+    model_flag="--model",
+    permission_flags=None,
+    allowed_tools_flag=None,
+    output_parser="codex_json",
+    process_pattern="codex",
+    prompt_prefix="You are a Codex worker in a Hermes collaboration engine.",
+    prompt_suffix="",
+    default_allowed_tools=[],
+    capabilities=["file-edit", "git-ops"],
+))
+_register_builtin(AgentBackend(
+    name="opencode",
+    display_name="OpenCode",
+    command=["opencode", "run"],
+    prompt_flag="",
+    output_format_flags=[],
+    supports_model_flag=False,
+    model_flag="--model",
+    permission_flags=None,
+    allowed_tools_flag=None,
+    output_parser="raw_text",
+    process_pattern="opencode",
+    prompt_prefix="You are an OpenCode worker in a Hermes collaboration engine.",
+    prompt_suffix="",
+    default_allowed_tools=[],
+    capabilities=["file-edit", "git-ops"],
+))
+_register_builtin(AgentBackend(
+    name="hermes",
+    display_name="Hermes Agent",
+    command=["hermes"],
+    prompt_flag="",
+    output_format_flags=[],
+    supports_model_flag=True,
+    model_flag="--model",
+    permission_flags=None,
+    allowed_tools_flag=None,
+    output_parser="raw_text",
+    process_pattern="hermes",
+    prompt_prefix="You are Hermes, the orchestration agent in a collaboration engine.",
+    prompt_suffix="",
+    default_allowed_tools=[],
+    capabilities=["planning", "analysis", "orchestration", "delegation", "file-edit", "git-ops", "search"],
+))
 
 
 def list_backends() -> list[AgentBackend]:

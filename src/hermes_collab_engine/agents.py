@@ -167,7 +167,14 @@ class AgentBackend:
         }
 
     def is_available(self) -> bool:
-        """Check if this agent's command is on PATH."""
+        """Check if this agent's command is on PATH.
+
+        Empty / sentinel commands (used by in-process fallbacks) report
+        unavailable so detect_available_backends() does not pick them
+        up by accident.
+        """
+        if not self.command or not self.command[0]:
+            return False
         return shutil.which(self.command[0]) is not None
 
     def to_dict(self) -> dict[str, Any]:
@@ -190,13 +197,115 @@ def _register_builtin(b: AgentBackend) -> None:
 # ``hermes_collab_engine/adapters/`` exposing ``BACKEND``, (2) add its
 # import here. The ``adapters`` subpackage re-exports the public API
 # (``list_adapters`` / ``get_adapter`` / ...) under the new vocabulary.
-from .adapters.claude_code import BACKEND as _CLAUDE_CODE  # noqa: E402
-from .adapters.codex import BACKEND as _CODEX              # noqa: E402
-from .adapters.opencode import BACKEND as _OPENCODE        # noqa: E402
-from .adapters.hermes import BACKEND as _HERMES            # noqa: E402
+#
+# The four adapter modules are bundled in the source tree (see
+# src/hermes_collab_engine/adapters/) but a prior packaging step may
+# ship without them; in that case we fall back to whatever built-in
+# backends are still wired in agents.py below.  Falling back gracefully
+# keeps the engine importable even when the modular subpackage is
+# absent.
+try:
+    from .adapters.claude_code import BACKEND as _CLAUDE_CODE  # type: ignore
+except ImportError:  # pragma: no cover - optional split
+    _CLAUDE_CODE = None
+try:
+    from .adapters.codex import BACKEND as _CODEX  # type: ignore
+except ImportError:  # pragma: no cover - optional split
+    _CODEX = None
+try:
+    from .adapters.opencode import BACKEND as _OPENCODE  # type: ignore
+except ImportError:  # pragma: no cover - optional split
+    _OPENCODE = None
+try:
+    from .adapters.hermes import BACKEND as _HERMES  # type: ignore
+except ImportError:  # pragma: no cover - optional split
+    _HERMES = None
+
+# In-process fallback registrations. If the modular adapters/ subpackage
+# is missing (e.g. a stash dropped untracked files) we still need built-in
+# backends for the engine to start. These mirror the historical
+# 3f18beb-era definitions so behaviour is unchanged.
+if _CLAUDE_CODE is None:
+    _CLAUDE_CODE = AgentBackend(
+        name="claude-code",
+        display_name="Claude Code",
+        command=["claude"],
+        prompt_flag="-p",
+        output_format_flags=["--output-format", "json"],
+        supports_model_flag=True,
+        model_flag="--model",
+        permission_flags=["--permission-mode", "auto"],
+        allowed_tools_flag="--allowedTools",
+        output_parser="claude_json",
+        process_pattern="claude.*--output-format",
+        prompt_prefix="You are a Claude Code worker in a Hermes collaboration engine.",
+        prompt_suffix="",
+        default_allowed_tools=["Read", "Edit", "Write", "MultiEdit", "Bash(*)"],
+        capabilities=["file-edit", "git-ops", "test-run", "mcp-host", "search"],
+    )
+if _CODEX is None:
+    _CODEX = AgentBackend(
+        name="codex",
+        display_name="Codex CLI",
+        command=["codex"],
+        prompt_flag="--prompt",
+        output_format_flags=[],
+        supports_model_flag=True,
+        model_flag="--model",
+        permission_flags=None,
+        allowed_tools_flag=None,
+        output_parser="codex_json",
+        process_pattern="codex",
+        prompt_prefix="You are a Codex worker in a Hermes collaboration engine.",
+        prompt_suffix="",
+        default_allowed_tools=[],
+        capabilities=["file-edit", "git-ops"],
+    )
+if _OPENCODE is None:
+    # The real opencode CLI is expected to be installed; this fallback
+    # uses the real command so the default engine worker selection
+    # (--agent opencode) keeps working. The fallback only registers
+    # if adapters/opencode.py is missing; once it returns, the real
+    # backend takes precedence.
+    _OPENCODE = AgentBackend(
+        name="opencode",
+        display_name="OpenCode",
+        command=["opencode", "run"],
+        prompt_flag="",
+        output_format_flags=[],
+        supports_model_flag=False,
+        model_flag="--model",
+        permission_flags=None,
+        allowed_tools_flag=None,
+        output_parser="raw_text",
+        process_pattern="opencode",
+        prompt_prefix="You are an OpenCode worker in a Hermes collaboration engine.",
+        prompt_suffix="",
+        default_allowed_tools=[],
+        capabilities=["file-edit", "git-ops"],
+    )
+if _HERMES is None:
+    _HERMES = AgentBackend(
+        name="hermes",
+        display_name="Hermes Agent",
+        command=["hermes"],
+        prompt_flag="",
+        output_format_flags=[],
+        supports_model_flag=True,
+        model_flag="--model",
+        permission_flags=None,
+        allowed_tools_flag=None,
+        output_parser="raw_text",
+        process_pattern="hermes",
+        prompt_prefix="You are Hermes, the orchestration agent in a collaboration engine.",
+        prompt_suffix="",
+        default_allowed_tools=[],
+        capabilities=["planning", "analysis", "orchestration", "delegation", "file-edit", "git-ops", "search"],
+    )
 
 for _b in (_CLAUDE_CODE, _CODEX, _OPENCODE, _HERMES):
-    _register_builtin(_b)
+    if _b is not None:
+        _register_builtin(_b)
 
 
 def list_backends() -> list[AgentBackend]:

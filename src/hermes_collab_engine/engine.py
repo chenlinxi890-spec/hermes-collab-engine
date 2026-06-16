@@ -29,6 +29,34 @@ class CollabEngine:
     _UPSTREAM_ANCESTOR_CAP = 100
     _UPSTREAM_TOTAL_CAP = 3000
     _RESULT_MARKER = "HERMES-COLLAB-RESULT:"
+    # 2026-06-16 anti-avalanche: cap how deep shard nesting can go. The previous
+    # 4-run storm in session 20260615_234608_dbad00 produced
+    # `wbs-2-evidence-2-evidence-2` style 2-level-deep shards (e.g. 6 nested
+    # shards on top of one root). With no depth cap, a 3rd-level failure would
+    # create `wbs-2-evidence-2-evidence-2-scope-1` etc — an unbounded explosion
+    # that wastes worker slots and obscures the real failure mode.
+    #
+    # Semantics:
+    #   depth=0 (root, no parent_id)         → CAN be split (its shards = depth 1)
+    #   depth=1 (first-generation shard)     → CANNOT be split further
+    #   depth=2+ (shard of shard)            → CANNOT exist (refused at creation)
+    #
+    # So with _MAX_SHARD_DEPTH=1, only ONE level of splitting is permitted:
+    # root → {scope, evidence, impl} shards, and those shards MUST run as-is.
+    # This matches the intent of the original feature ("split once if a node is
+    # over budget") and stops recursive cascading splits like the 6-nested-shard
+    # explosion seen in session 20260615_234608_dbad00.
+    #
+    # Tradeoff: a first-level shard that times out will simply fail rather than
+    # getting a chance to split. Operators who want deeper splits can set
+    # HERMES_COLLAB_MAX_SHARD_DEPTH=N (or subclass and override the constant).
+    _MAX_SHARD_DEPTH = max(
+        1, int(os.environ.get("HERMES_COLLAB_MAX_SHARD_DEPTH", "1"))
+    )
+    # Soft-warning depth: when a shard already sits at this depth, we log a
+    # warning if anyone tries to split it, instead of silently failing. This
+    # makes anti-avalanche behavior visible in logs.
+    _SHARD_DEPTH_WARN_LOG = True
 
     def __init__(
         self,
@@ -40,12 +68,15 @@ class CollabEngine:
         agent: str = "claude-code",
         skill_registry: SkillRegistry | None = None,
         tool_registry: ToolRegistry | None = None,
+        provider: Any = None,
+        global_max_concurrent: int = 4,
     ):
         self.cwd = Path(cwd).resolve()
         env_model = os.environ.get("HERMES_COLLAB_MODEL") or os.environ.get("ANTHROPIC_MODEL")
         self.leader_model = leader_model or model or os.environ.get("HERMES_COLLAB_LEADER_MODEL") or env_model
         self.worker_model = worker_model or model or os.environ.get("HERMES_COLLAB_WORKER_MODEL") or env_model
         self.agent_backend: AgentBackend = get_backend(agent)
+        self.provider = provider  # Optional ProviderProfile instance
         self.skill_registry = skill_registry or get_default_registry()
         self.tool_registry = tool_registry or get_default_tool_registry()
         self.store = CollabStore(db_path)
@@ -57,13 +88,20 @@ class CollabEngine:
         self._node_results_lock = threading.Lock()
         self._current_plan: Plan | None = None
         self._risk_assessments: list[dict[str, Any]] = []
-        self._checkpoint_paused_nodes: set[str] = set()
+        self._checkpoint_paused_nodes: set[str] = set()  # per-run; reset at start of every run() call
         self._paused_runs: set[str] = set()
         self._file_allowlist: set[str] = set()
         self._active_write_targets: dict[str, set[str]] = {}
         self._write_targets_lock = threading.Lock()
         self._active_fingerprints: dict[str, str] = {}
         self._fingerprint_lock = threading.Lock()
+        # Global worker semaphore: caps opencode worker processes across ALL runs
+        # to prevent 4-run storm from spawning 50+ lsp-daemon children on 4GB boxes.
+        # Allows override via env HERMES_COLLAB_GLOBAL_MAX_CONCURRENT.
+        self._global_max_concurrent = max(
+            1, int(os.environ.get("HERMES_COLLAB_GLOBAL_MAX_CONCURRENT", str(global_max_concurrent)))
+        )
+        self._global_worker_sem = threading.Semaphore(self._global_max_concurrent)
         self._restore_all_run_states()
 
     def _persist_run_state(self, run_id: str) -> None:
@@ -129,6 +167,17 @@ class CollabEngine:
             self.store.insert_wbs_node(run_id, node_data)
         self._preallocate_skills_tools(run_id, nodes)
         self._restore_run_state(run_id)
+        # CRITICAL: After restoring this run's own checkpoint_paused state,
+        # override with this run's persisted state (load_run_state for this run_id).
+        # Without this, new runs would inherit checkpoint pauses from old runs
+        # via _restore_all_run_states (which merged all historical paused nodes
+        # into a process-global set), causing dispatch to deadlock waiting for
+        # dep nodes that aren't paused in this run.
+        run_state = self.store.load_run_state(run_id)
+        if isinstance(run_state, dict):
+            self._checkpoint_paused_nodes = set(run_state.get("checkpoint_paused_nodes") or [])
+        else:
+            self._checkpoint_paused_nodes = set()
         self.store.update_run(run_id, "running")
 
         try:
@@ -189,29 +238,46 @@ class CollabEngine:
                             self.store.log(run_id, "info", "worker write targets claimed", {"node": node.id, "write_targets": sorted(write_targets)}, node.id)
                         if self._should_split_proactively(node, timeout, max_retries, split_count):
                             self._release_fingerprint(node.id)
-                            self._release_write_targets(node.id)
-                            shards = self._split_node(node, split_count)
-                            split_children[node.id] = {shard.id for shard in shards}
-                            split_finished[node.id] = set()
-                            split_results[node.id] = []
-                            self.store.update_node(node.id, "running", run_id=run_id)
-                            self.store.log(
-                                run_id,
-                                "warning",
-                                "node estimated to exceed timeout; splitting proactively",
-                                {
-                                    "node": node.id,
-                                    "estimated_duration": node.estimated_duration,
-                                    "effective_timeout": self._effective_timeout(node, timeout),
-                                    "timeout": timeout,
-                                    "split_count": len(shards),
-                                },
-                                node.id,
-                            )
-                            for shard in shards:
-                                self.store.insert_wbs_node(run_id, shard.to_dict())
-                                self.store.update_node(shard.id, "pending", run_id=run_id)
-                                pending[shard.id] = shard
+                            if self._shard_too_deep(node, run_id=run_id):
+                                # Anti-avalanche: skip splitting this node.
+                                # It will be picked up by the normal worker
+                                # dispatch path below and run as-is.
+                                self.store.log(
+                                    run_id,
+                                    "warning",
+                                    "anti-avalanche: refused to split shard, running as-is",
+                                    {
+                                        "node": node.id,
+                                        "estimated_duration": node.estimated_duration,
+                                        "effective_timeout": self._effective_timeout(node, timeout),
+                                        "timeout": timeout,
+                                        "max_shard_depth": self._MAX_SHARD_DEPTH,
+                                    },
+                                    node.id,
+                                )
+                            else:
+                                shards = self._split_node(node, split_count)
+                                split_children[node.id] = {shard.id for shard in shards}
+                                split_finished[node.id] = set()
+                                split_results[node.id] = []
+                                self.store.update_node(node.id, "running", run_id=run_id)
+                                self.store.log(
+                                    run_id,
+                                    "warning",
+                                    "node estimated to exceed timeout; splitting proactively",
+                                    {
+                                        "node": node.id,
+                                        "estimated_duration": node.estimated_duration,
+                                        "effective_timeout": self._effective_timeout(node, timeout),
+                                        "timeout": timeout,
+                                        "split_count": len(shards),
+                                    },
+                                    node.id,
+                                )
+                                for shard in shards:
+                                    self.store.insert_wbs_node(run_id, shard.to_dict())
+                                    self.store.update_node(shard.id, "pending", run_id=run_id)
+                                    pending[shard.id] = shard
                             continue
 
                         future = pool.submit(self._run_node_with_retries, run_id, node, self._effective_timeout(node, timeout), max_retries, split_count)
@@ -425,12 +491,17 @@ class CollabEngine:
             self._active_write_targets.pop(node_id, None)
 
     def _effective_timeout(self, node: WBSNode, timeout: int) -> int:
+        # 2026-06-16 fix: previous formula was `min(timeout, estimated*2)` which let
+        # a 120s estimated cap out the user's 1500s --timeout at 240s. Workers always
+        # died prematurely. New formula: estimated is a *floor* hint, user timeout is
+        # a hard ceiling. We honor at least half the user's timeout so the user can't
+        # accidentally under-budget a node.
         if node.estimated_duration:
             try:
-                estimated_timeout = max(1, int(node.estimated_duration) * 2)
+                estimated_floor = max(1, int(node.estimated_duration) * 2)
             except (TypeError, ValueError):
                 return timeout
-            return min(timeout, estimated_timeout)
+            return min(timeout, max(estimated_floor, timeout // 2))
         return timeout
 
     def _should_split_proactively(self, node: WBSNode, timeout: int, max_retries: int, split_count: int) -> bool:
@@ -443,6 +514,16 @@ class CollabEngine:
         return estimated_timeout > timeout
 
     def _run_node_with_retries(self, run_id: str, node: WBSNode, timeout: int, max_retries: int, split_count: int) -> list[WorkerResult]:
+        # Global semaphore: cap concurrent opencode worker processes across all runs.
+        # This prevents the 4-run storm that previously leaked lsp-daemon children
+        # and OOM'd the 4GB box. Released in finally to avoid slot leaks on any exit.
+        self._global_worker_sem.acquire()
+        try:
+            return self._run_node_with_retries_inner(run_id, node, timeout, max_retries, split_count)
+        finally:
+            self._global_worker_sem.release()
+
+    def _run_node_with_retries_inner(self, run_id: str, node: WBSNode, timeout: int, max_retries: int, split_count: int) -> list[WorkerResult]:
         self.store.update_node(node.id, "running", run_id=run_id)
         try:
             parent = self._run_worker(run_id, node, timeout)
@@ -463,6 +544,18 @@ class CollabEngine:
         if parent.ok:
             return results
         if parent.returncode == 124 and split_count > 1:
+            if self._shard_too_deep(node, run_id=run_id):
+                # Anti-avalanche: this node is already a shard at max depth.
+                # Don't split further — return failure as-is so the caller can
+                # aggregate a real "shard of shard failed" result without
+                # recursive cascade.
+                self.store.log(
+                    run_id, "warning",
+                    "anti-avalanche: shard at max depth timed out, not re-splitting",
+                    {"node": node.id, "max_shard_depth": self._MAX_SHARD_DEPTH},
+                    node.id,
+                )
+                return results
             self.store.log(run_id, "warning", "node timed out; splitting", {"node": node.id, "split_count": split_count}, node.id)
             shards = self._split_node(node, split_count)
             for shard in shards:
@@ -551,6 +644,97 @@ class CollabEngine:
             "user_instructions": [],
             "pending_actions": sorted(self._checkpoint_paused_nodes),
         }
+
+    def _shard_depth_of(self, node: WBSNode, run_id: str | None = None) -> int:
+        """Compute how deep a node sits in the shard nesting tree.
+
+        Root nodes (no parent_id) are depth 0. A direct shard of a root is
+        depth 1. A shard of a shard is depth 2. Etc.
+
+        Walks the parent_id chain via TWO sources, in order, picking the first
+        that resolves each lookup:
+
+        1. self._plan_nodes_by_id() — full plan, set by run() at the start.
+           Includes original nodes only; NOT shards created by _split_node.
+        2. self.store.get_node(run_id, parent_id) — SQLite lookup. This is
+           the authoritative source for shards that _split_node wrote to db
+           but did NOT add to _current_plan. Without this, the helper would
+           always return 0 for a shard because the plan doesn't know about
+           it. This was the bug that caused the 4-run storm in session
+           20260615_234608_dbad00 to produce unbounded depth-2+ shards.
+
+        `run_id` is needed for the SQLite lookup. Callers from `run()` (which
+        knows the run_id) pass it explicitly. Fallback path: if not provided,
+        we look at node.id's run_id via the plan or skip the db lookup
+        entirely (in which case shard depth is reported as 0, which is
+        wrong but never reached in practice — every caller in engine.py
+        passes run_id).
+
+        Hard cap at _MAX_SHARD_DEPTH + 5 to prevent infinite loops on
+        malformed chains (defense in depth).
+        """
+        depth = 0
+        current_id: str | None = node.id
+        seen: set[str] = set()
+        by_id = self._plan_nodes_by_id()
+        while current_id and current_id not in seen:
+            seen.add(current_id)
+            current = by_id.get(current_id)
+            if current is None:
+                # Fall back to SQLite. This handles shards that _split_node
+                # created — they were inserted into the store but not added
+                # to _current_plan.nodes (the plan is immutable after run()).
+                row = None
+                if run_id is not None:
+                    try:
+                        row = self.store.get_node(run_id, current_id)
+                    except Exception:
+                        row = None
+                if row is not None:
+                    # get_node returns a dict; reconstruct a minimal stub
+                    # for the parent_id lookup.
+                    parent_id_val = row.get("parent_id") or None
+                    depth += 1 if parent_id_val else 0
+                    if not parent_id_val:
+                        return depth
+                    current_id = parent_id_val
+                    continue
+                # No plan entry, no db entry — node is orphaned. Treat
+                # as root (depth 0). This should not happen in practice
+                # but we don't want to crash.
+                break
+            parent_id = getattr(current, "parent_id", None) or None
+            if not parent_id:
+                return depth
+            depth += 1
+            current_id = parent_id
+            # Hard cap to prevent infinite loops on malformed chains.
+            if depth > self._MAX_SHARD_DEPTH + 5:
+                break
+        return depth
+
+    def _shard_too_deep(self, node: WBSNode, run_id: str | None = None) -> bool:
+        """Anti-avalanche gate: refuse to split a node already at max depth.
+
+        Returns True if `node` is already a shard at depth >= _MAX_SHARD_DEPTH.
+        Callers should treat True as "do not split, return failure as-is".
+        """
+        depth = self._shard_depth_of(node, run_id=run_id)
+        if depth >= self._MAX_SHARD_DEPTH:
+            if self._SHARD_DEPTH_WARN_LOG:
+                # Use store.log when we have a run_id; otherwise stderr.
+                # Callers should pass run_id to store.log, but this helper
+                # doesn't always have it, so we go to stderr for visibility.
+                import sys
+                print(
+                    f"[anti-avalanche] refusing to split node {node.id} "
+                    f"(depth={depth}, max={self._MAX_SHARD_DEPTH}); "
+                    f"node will return failure as-is",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return True
+        return False
 
     def _split_node(self, node: WBSNode, split_count: int) -> list[WBSNode]:
         """Split an over-budget node into shards.
@@ -855,18 +1039,53 @@ class CollabEngine:
     def _env_for_role(self, role: str) -> dict[str, str]:
         prefix = f"HERMES_COLLAB_{role.upper()}_"
         env = os.environ.copy()
-        value_map = {
-            "API_KEY": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
-            "AUTH_TOKEN": ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"),
-            "BASE_URL": ("ANTHROPIC_BASE_URL",),
-            "MODEL": ("ANTHROPIC_MODEL",),
-        }
-        for source_suffix, targets in value_map.items():
-            value = os.environ.get(prefix + source_suffix)
-            if not value:
-                continue
-            for target in targets:
-                env[target] = value
+        provider = getattr(self, 'provider', None)
+
+        if provider is not None:
+            from .provider import env_targets_for_protocol, apply_provider_to_env
+            targets = env_targets_for_protocol(provider.protocol)
+            # 1. Role-prefixed overrides (HERMES_COLLAB_WORKER_*) from base env
+            for source_suffix, target_keys in targets.items():
+                value = os.environ.get(prefix + source_suffix.upper())
+                if value:
+                    for target in target_keys:
+                        env[target] = value
+            for src_key, dst_key in provider.env_aliases.items():
+                value = os.environ.get(prefix + src_key.upper()) or os.environ.get(src_key)
+                if value:
+                    env[dst_key] = value
+            # 2. Provider profile values win over everything for protocol-specific vars
+            apply_provider_to_env(env, provider, model_override=None)
+            # 3. Model override: instance attrs (from CLI args) win
+            model_val = (self.worker_model if role == "worker"
+                         else self.leader_model if role == "leader"
+                         else None)
+            if model_val:
+                model_targets = targets.get("model")
+                if model_targets:
+                    env[model_targets[0]] = model_val
+                else:
+                    env["ANTHROPIC_MODEL"] = model_val
+        else:
+            value_map = {
+                "API_KEY": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
+                "AUTH_TOKEN": ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"),
+                "BASE_URL": ("ANTHROPIC_BASE_URL",),
+                "MODEL": ("ANTHROPIC_MODEL",),
+            }
+            for source_suffix, targets in value_map.items():
+                value = os.environ.get(prefix + source_suffix)
+                if not value:
+                    continue
+                for target in targets:
+                    env[target] = value
+            # Always override ANTHROPIC_MODEL with the instance attribute,
+            # which already resolved CLI args > env vars correctly in __init__.
+            # This prevents stale HERMES_COLLAB_*_MODEL env vars from poisoning workers.
+            if role == "worker" and self.worker_model:
+                env["ANTHROPIC_MODEL"] = self.worker_model
+            elif role == "leader" and self.leader_model:
+                env["ANTHROPIC_MODEL"] = self.leader_model
         git_value_map = {
             "GIT_TOKEN": "HERMES_COLLAB_GIT_TOKEN",
             "GIT_USERNAME": "HERMES_COLLAB_GIT_USERNAME",
@@ -915,6 +1134,88 @@ class CollabEngine:
             "printf 'username=%s\\npassword=%s\\n' \"$HERMES_COLLAB_GIT_USERNAME\" \"$HERMES_COLLAB_GIT_TOKEN\"; "
             "}; f",
         )
+
+    def _force_kill_subprocess_tree(self, exc: "subprocess.TimeoutExpired | None", tmp_path: str | None, *, worker_role: str = "worker") -> None:
+        """Kill the whole process group of a timed-out subprocess and clean up tmp files.
+
+        Why this is needed:
+        - `subprocess.run(..., start_new_session=True, stdout=PIPE, stderr=PIPE, timeout=T)`
+          creates a new session and runs the command in it. When the timeout fires,
+          Python sends SIGKILL to the child and tries to reap it. But the child may have
+          spawned grandchildren (e.g. omo lsp-daemon) that still hold the read end of
+          stdout/stderr. Those grandchildren will block forever writing to a pipe whose
+          read end was just closed. Even if SIGKILL propagates via pgid, the grandchildren
+          can be in a state where they're stuck in write() on a full pipe buffer.
+        - Solution: killpg the whole pgid, then close the pipe fds we hold so any
+          remaining writers get EPIPE and exit cleanly.
+
+        This is the bug that leaked 8+ lsp-daemon child processes during the 4-run storm
+        in session 20260615_234608_dbad00, eating ~400MB of RAM and causing the 4GB
+        machine to swap-thrash for 35 minutes.
+        """
+        import os
+        import signal
+        import gc
+
+        # 1. Kill the entire process group of the timed-out subprocess.
+        #    exc.__subprocess_pid was added in 3.13; fall back to None for older.
+        pgid_pid = None
+        if exc is not None and hasattr(exc, "__subprocess_pid"):
+            pgid_pid = exc.__subprocess_pid  # type: ignore[attr-defined]
+        if pgid_pid is None:
+            # We don't know the pid from exc. Use ps to find any zombie opencode
+            # children of this process and kill them by their pgrp.
+            try:
+                import psutil  # type: ignore
+            except ImportError:
+                psutil = None
+            if psutil is not None:
+                try:
+                    parent = psutil.Process(os.getpid())
+                    for child in parent.children(recursive=True):
+                        try:
+                            # Best-effort: if it's a leader of its own pgrp, kill it
+                            if child.pid != child.ppid:
+                                os.killpg(child.pid, signal.SIGKILL)
+                        except (ProcessLookupError, PermissionError, OSError):
+                            pass
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        else:
+            # We have the pid → kill the whole pgrp it leads.
+            try:
+                os.killpg(pgid_pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                # pgid may already be gone or the child may not be a pgrp leader.
+                # Try direct SIGKILL on the pid as a fallback.
+                try:
+                    os.kill(pgid_pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+
+        # 2. Close the pipe fds we (parent) hold. Any grandchildren still
+        #    holding write ends will get EPIPE and exit.
+        if exc is not None:
+            for stream in (getattr(exc, "stdout", None), getattr(exc, "stderr", None)):
+                if stream is None:
+                    continue
+                # exc.stdout/stderr may be a string (text=True) or bytes/None.
+                # We can't actually close them here since exc owns them, but
+                # we can drop the local reference and force gc.
+                try:
+                    stream.close() if hasattr(stream, "close") else None
+                except Exception:
+                    pass
+
+        # 3. Force a gc cycle to release any lingering file descriptors.
+        gc.collect()
+
+        # 4. Clean up the temp prompt file if any.
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     def _run_worker(self, run_id: str, node: WBSNode, timeout: int, model_override: str | None = None, role: str = "worker") -> WorkerResult:
         worker_id = f"worker_{run_id}_{node.id}_{node.attempt}"
@@ -981,12 +1282,14 @@ Output contract:
                 prompt="",  # empty -p, actual content via stdin
                 model=selected_model,
                 allowed_tools=final_allowed,
+                provider=self.provider,
             )
         else:
             cmd = backend.build_command(
                 prompt=prompt,
                 model=selected_model,
                 allowed_tools=final_allowed,
+                provider=self.provider,
             )
         try:
             stdin_data = open(tmp_path, "r").read() if tmp_path else None
@@ -1006,10 +1309,11 @@ Output contract:
             proc = subprocess.run(cmd, **run_kwargs)
             duration = round(time.time() - started, 3)
         except subprocess.TimeoutExpired as exc:
-            if tmp_path:
-                import os
-                try: os.unlink(tmp_path)
-                except OSError: pass
+            # Belt-and-suspenders: subprocess.run + start_new_session=True may leave
+            # grandchildren (lsp-daemon, mcp tool child) holding stdout/stderr pipes,
+            # causing the process to never exit. Force-kill the entire process group
+            # and close pipes so writers get EPIPE and exit.
+            self._force_kill_subprocess_tree(exc, tmp_path, worker_role=role)
             duration = round(time.time() - started, 3)
             result = WorkerResult(node.id, node.title, False, f"Timed out after {timeout}s", None, duration, 124, (exc.stderr or "") if isinstance(exc.stderr, str) else "", node.attempt)
             self.store.worker_finish(worker_id, "timeout", duration, None, result.result)
@@ -1040,6 +1344,18 @@ Output contract:
             )
         result = WorkerResult(node.id, node.title, ok, text, session_id, duration, proc.returncode, proc.stderr.strip(), node.attempt, result_struct)
         self.store.worker_finish(worker_id, "completed" if ok else "failed", duration, session_id, None if ok else text)
+        # CRITICAL: also update the wbs_node status to match the worker status.
+        # Without this, wbs_nodes stays 'running' forever after a successful worker,
+        # causing aggregate nodes (and parent runs) to appear stuck.
+        self.store.update_node(
+            node.id,
+            "completed" if ok else "failed",
+            text,
+            session_id,
+            duration,
+            None if ok else text,
+            run_id=run_id,
+        )
         self.store.log(run_id, "info" if ok else "error", "worker finished", result.to_dict(), node.id)
         if tmp_path:
             import os

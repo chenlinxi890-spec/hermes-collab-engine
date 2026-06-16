@@ -62,8 +62,13 @@ class WBSNode:
 @dataclass
 class RiskPolicy:
     low: str = "continue"
-    medium: str = "checkpoint"
-    high: str = "checkpoint"
+    # CRITICAL: medium/high default to "continue" (not "checkpoint") because
+    # "checkpoint" pauses downstream nodes indefinitely (adds node to
+    # _checkpoint_paused_nodes set, blocking deps). In CI/non-interactive mode
+    # there's no user to resume, so pipeline deadlocks. Worker risks are
+    # logged for human review via `parent-log` after run completion.
+    medium: str = "continue"
+    high: str = "continue"
     checkpoint_timeout: int = 900
 
     @classmethod

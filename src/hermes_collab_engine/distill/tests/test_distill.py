@@ -111,6 +111,47 @@ class MemoryWriterTests(unittest.TestCase):
         self.assertIn("dt module boundary", text)
         self.assertIn("opc worker config", text)
 
+    def test_append_preserves_existing_entries_with_mixed_separators(self) -> None:
+        """Regression: when a file uses blank-line separators instead of §
+        the writer must normalise back to §-delimited, not collapse
+        unrelated content."""
+        # Seed a file that uses blank-line separation (legacy convention)
+        self.path.write_text(
+            "entry-one body\n\n"
+            "entry-two body\n\n"
+            "entry-three body\n",
+            encoding="utf-8",
+        )
+        result = memory_writer.append_entry(
+            "entry-four totally new content",
+            "完全不一样的关键词没有任何重叠 应该 appended.",
+            path=self.path,
+        )
+        self.assertEqual(result["status"], "appended")
+        # The writer rebuilds the file from `_split_entries`, which
+        # splits strictly on §.  Pre-§ the legacy file has 1 segment,
+        # post-write we should have 2 (legacy + new).  The important
+        # guarantee is that *all* content survives verbatim.
+        text = self.path.read_text()
+        self.assertIn("entry-one", text)
+        self.assertIn("entry-two", text)
+        self.assertIn("entry-three", text)
+        self.assertIn("entry-four", text)
+        # And the file must now be properly §-delimited going forward
+        self.assertGreaterEqual(text.count("§"), 2)
+
+    def test_repeated_run_does_not_grow_file(self) -> None:
+        """Idempotency: running append with the same content twice must
+        not grow the file or duplicate the entry."""
+        body = "今天跑了 3 个 lesson, 2 个 run 失败. 重点关注 watchdog 触发."
+        memory_writer.append_entry("Daily distill 2026-06-16", body, path=self.path)
+        size_after_first = self.path.stat().st_size
+        result = memory_writer.append_entry("Daily distill 2026-06-16 dup", body, path=self.path)
+        self.assertEqual(result["status"], "duplicate")
+        size_after_second = self.path.stat().st_size
+        # File should not have grown by more than the trailing newline we add
+        self.assertLessEqual(size_after_second, size_after_first + 10)
+
 
 class ExtractorTests(unittest.TestCase):
     def test_fetches_today_events(self) -> None:

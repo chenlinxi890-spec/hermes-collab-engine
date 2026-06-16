@@ -81,23 +81,27 @@ def append_entry(title: str, body: str, *, path: Path = MEMORY_FILE) -> dict:
     created = not path.exists()
     if best_score >= overlap_threshold:
         # Mark the existing entry as reinforced, don't duplicate.
-        new_text = "\n\n".join(_split_entries(
-            (path.read_text(encoding="utf-8") if path.exists() else "")
-        ))
-        path.write_text(new_text + "\n§\n", encoding="utf-8")
+        # Rewrite the file by joining current entries with §, then
+        # append a trailing § so future appends stay well-formed.
+        existing_text = path.read_text(encoding="utf-8") if path.exists() else ""
+        current_entries = _split_entries(existing_text)
+        joined = "\n§\n".join(current_entries) + "\n§\n"
+        path.write_text(joined, encoding="utf-8")
         return {
             "status": "duplicate",
             "duplicate_of_index": best_idx,
             "overlap": round(best_score, 3),
             "path": str(path),
         }
-    new_text = (path.read_text(encoding="utf-8") if path.exists() else "").rstrip()
-    if new_text and not new_text.endswith("§"):
-        new_text += "\n§\n"
-    elif new_text.endswith("§"):
-        new_text += "\n"
-    new_text += new_block + "\n"
-    path.write_text(new_text, encoding="utf-8")
+    # Non-duplicate path: preserve every existing entry verbatim and
+    # append a new one.  We rebuild the file from `_split_entries`
+    # so we never accidentally re-flow unrelated content.
+    existing_text = path.read_text(encoding="utf-8") if path.exists() else ""
+    current_entries = _split_entries(existing_text)
+    new_entries = current_entries + [new_block]
+    joined = "\n§\n".join(new_entries) + "\n§\n"
+    path.write_text(joined, encoding="utf-8")
+    created = not path.exists() or not existing_text
     return {
         "status": "appended" if not created else "created",
         "entry": new_block,

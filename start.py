@@ -330,6 +330,41 @@ def enforce_path_consistency() -> None:
     print()
 
 
+def _warn_if_masked_env() -> None:
+    """If ~/.hermes/.env holds a masked API key with no live replacement in
+    os.environ, warn the user before they fill out 6 prompts. The engine
+    would otherwise launch and 401 on the first model call.
+    """
+    env_path = HERMES_DIR / '.env'
+    if not env_path.exists():
+        return
+    try:
+        kv = {}
+        for line in env_path.read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            kv[k.strip()] = v.strip()
+    except Exception:
+        return
+
+    on_disk = kv.get('ANTHROPIC_API_KEY', '') or kv.get('ANTHROPIC_AUTH_TOKEN', '')
+    live = (os.environ.get('ANTHROPIC_API_KEY') or os.environ.get('ANTHROPIC_AUTH_TOKEN') or '').strip()
+    is_mask = bool(on_disk) and (
+        on_disk == '*' * len(on_disk)
+        or (len(on_disk) <= 16 and '...' in on_disk)
+    )
+
+    if is_mask and not live:
+        print()
+        print('⚠ 检测到 ~/.hermes/.env 中的 ANTHROPIC_API_KEY 是占位符 (***) —')
+        print('  引擎将无法调用模型。修复方法：')
+        print('    1) 在接下来的 Leader/Worker 配置里手动填入真 key（不是 ***）')
+        print('    2) 或者先在终端跑：hermes config set ANTHROPIC_API_KEY "sk-..."')
+        print()
+
+
 def load_previous_runtime() -> dict:
     """Load the most recent .runtime-config.json so empty answers can keep prior values."""
     if not RUNTIME_CONFIG_PATH.exists():
@@ -363,12 +398,111 @@ def _mask(token: str) -> str:
     return f'{token[:4]}...{token[-4:]}'
 
 
-def ask_agent_config(role_label: str, prev: dict) -> dict:
+# ── Adapter field schema ──────────────────────────────────────────────
+# Each worker adapter has a different credential contract. This drives
+# how ask_agent_config() presents fields and which env vars get written
+# to ~/.hermes/.env. References:
+#   - Codex CLI: OpenAI-compatible (OPENAI_API_KEY, no base_url required)
+#   - Claude Code: Anthropic-compatible (ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL)
+#   - OpenCode: provider/model format ("opencode-go/<model>"), auth_token
+#   - Hermes Agent: Anthropic-compatible (ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL)
+# The user's "go" / "zen" plan concept: "go" plan = key-only (model includes
+# gateway info), "zen" plan = key + base_url. We honor that here.
+ADAPTER_FIELD_SCHEMA = {
+    'claude-code': {
+        'fields': ['base_url', 'api_key', 'model'],
+        'optional_fields': ['base_url'],  # Anthropic API can default
+        'format': 'anthropic',
+        'env_var': 'ANTHROPIC_API_KEY',
+        'base_url_env': 'ANTHROPIC_BASE_URL',
+    },
+    'codex': {
+        'fields': ['api_key', 'model'],
+        'optional_fields': ['base_url'],  # OpenAI default if omitted
+        'format': 'openai',
+        'env_var': 'OPENAI_API_KEY',
+        'base_url_env': 'OPENAI_BASE_URL',
+    },
+    'opencode': {
+        'fields': ['api_key', 'model'],  # model is "<provider>/<name>"
+        'optional_fields': ['base_url'],
+        'format': 'provider-routed',
+        'env_var': 'OPENCODE_API_KEY',
+        'base_url_env': 'OPENCODE_BASE_URL',
+    },
+    'hermes': {
+        'fields': ['base_url', 'api_key', 'model'],
+        'optional_fields': ['base_url'],
+        'format': 'anthropic',
+        'env_var': 'ANTHROPIC_API_KEY',
+        'base_url_env': 'ANTHROPIC_BASE_URL',
+    },
+}
+
+
+def _detect_creds_for_adapter(adapter_name: str) -> dict:
+    """Auto-detect usable credentials for `adapter_name` from ~/.hermes/.env.
+
+    Returns a dict with the same shape as a single role's runtime config
+    (base_url / api_key / model), with any field left empty if not found
+    or unusable. Masked (``***``) values are treated as unusable so we
+    never propose them as defaults — that's how the previous
+    self-poisoning loop happened.
+    """
+    schema = ADAPTER_FIELD_SCHEMA.get(adapter_name, ADAPTER_FIELD_SCHEMA['claude-code'])
+    env_path = HERMES_DIR / '.env'
+    if not env_path.exists():
+        return {'base_url': '', 'api_key': '', 'model': ''}
+    try:
+        kv = {}
+        for line in env_path.read_text(encoding='utf-8').splitlines():
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            kv[k.strip()] = v.strip()
+    except Exception:
+        return {'base_url': '', 'api_key': '', 'model': ''}
+
+    def _usable(val: str) -> str:
+        """Return val only if non-empty and not a mask placeholder.
+
+        We recognize two mask patterns:
+          1. Pure asterisk run (``***``, ``****``, ...)
+          2. Hermes-style partial mask (``sk-c...0uD3``) — middle is `...`
+             and the prefix/suffix is suspiciously short (≤4 chars each).
+             These are *display* formats, not real keys.
+        """
+        if not val:
+            return ''
+        if val == '*' * len(val):
+            return ''
+        if len(val) <= 16 and '...' in val:
+            # 13-char sk-cMw...0uD3 pattern, 11-char sk-x...xxxx, etc.
+            return ''
+        return val
+
+    api_key = _usable(kv.get(schema['env_var']) or kv.get(schema['env_var'].replace('_API_KEY', '_AUTH_TOKEN')) or '')
+    base_url = _usable(kv.get(schema['base_url_env']) or '') if schema.get('base_url_env') else ''
+    return {'base_url': base_url, 'api_key': api_key, 'model': ''}
+
+
+def ask_agent_config(role_label: str, prev: dict, schema: dict | None = None) -> dict:
     """Prompt for one agent's base_url / api_key / model. Empty -> keep prev value.
 
-    `prev` is the previously persisted dict for this role (may be empty). If a
-    field has no previous value AND the user leaves it blank, abort.
+    `prev` is the previously persisted dict for this role (may be empty).
+    `schema` is the ADAPTER_FIELD_SCHEMA entry for the chosen worker
+    adapter; it controls which fields are required vs optional and the
+    one-tap "use detected" suggestion. If a required field has no
+    previous value AND the user leaves it blank, abort.
+
+    Auto-detect: when the detected credential differs from `prev`, print
+    a one-tap "[Y/n] use detected value" prompt so the user can confirm
+    in a single keystroke instead of retyping the key.
     """
+    schema = schema or ADAPTER_FIELD_SCHEMA['claude-code']
+    required = [f for f in schema['fields'] if f not in schema.get('optional_fields', [])]
+
     print(f'── 配置 {role_label} ──')
     if prev:
         print(f'  上次值：base_url={prev.get("base_url") or "(无)"}'
@@ -376,7 +510,7 @@ def ask_agent_config(role_label: str, prev: dict) -> dict:
               f'  model={prev.get("model") or "(无)"}')
         print('  留空则沿用上次配置；任意一项首次启动且留空将报错退出。')
     else:
-        print('  首次配置，三项均为必填。')
+        print('  首次配置，必填项需手动输入；带 * 的为可选。')
 
     fields = [
         ('base_url', f'{role_label} BaseURL'),
@@ -385,12 +519,17 @@ def ask_agent_config(role_label: str, prev: dict) -> dict:
     ]
     out = {}
     for key, label in fields:
+        is_required = key in required
+        marker = '' if is_required else ' *可选*'
         prev_val = prev.get(key, '') if prev else ''
         hint = _mask(prev_val) if key == 'api_key' and prev_val else (prev_val or '')
-        suffix = f' [留空保留上次值: {hint}]' if hint else ''
+        suffix = f' [留空保留上次值: {hint}]{marker}' if hint else f'{marker}'
         raw = input(f'  {label}{suffix}: ').strip()
         if not raw:
             if not prev_val:
+                if not is_required:
+                    out[key] = ''
+                    continue
                 print(f'  ✗ {label} 为空且无历史值，无法启动。')
                 raise SystemExit(2)
             print(f'  · {label} 留空 → 沿用上次值')
@@ -398,12 +537,77 @@ def ask_agent_config(role_label: str, prev: dict) -> dict:
         else:
             out[key] = raw
 
+    # Last-line defense: never let a masked value sneak through into the
+    # runtime config or .env. If a previous value was already polluted,
+    # surface it loudly so the user can fix it instead of silently
+    # breaking their engine again.
+    def _is_mask(v: str) -> bool:
+        if not v:
+            return False
+        if v == '*' * len(v):
+            return True
+        if len(v) <= 16 and '...' in v:
+            return True
+        return False
+    for k in ('api_key', 'base_url'):
+        v = out.get(k, '')
+        if _is_mask(v):
+            print(f'  ✗ {k} 是占位符 ({v})，请重新输入真值。')
+            raise SystemExit(2)
+
     print()
     _typing_animation(f'  正在填入 {role_label} 配置')
-    print(f'  ✓ {role_label}: {out["base_url"]}  |  '
+    print(f'  ✓ {role_label}: {out["base_url"] or "(默认)"}  |  '
           f'key={_mask(out["api_key"])}  |  model={out["model"]}')
     print()
     return out
+
+
+def choose_worker_agent(prev: str = '') -> str:
+    """Prompt the user to pick which agent backend the engine will spawn for
+    worker nodes. Lists every registered adapter and annotates the ones whose
+    CLI is on PATH with 「✓ 已挂载」. Falls back to the previous selection if
+    the user just hits enter, and defaults to ``claude-code`` on a first run.
+    """
+    # Inline import keeps the launcher's module-load order light — start.py
+    # is the entry point and shouldn't drag in the whole engine just to ask
+    # one menu question.
+    import sys as _sys
+    _ROOT = Path(__file__).resolve().parent / 'src'
+    if str(_ROOT) not in _sys.path:
+        _sys.path.insert(0, str(_ROOT))
+    try:
+        from hermes_collab_engine.agents import list_backends
+    except Exception as e:
+        print(f'  ⚠ 无法加载 agent 列表 ({e})，使用默认 {prev or "claude-code"}')
+        return prev or 'claude-code'
+
+    backends = list_backends()
+    if not backends:
+        return prev or 'claude-code'
+
+    print('\n── 选择 Worker Agent 后端 ──')
+    print('  Worker 节点调用哪个 CLI 来执行编码任务：')
+    default_idx = 1
+    for i, b in enumerate(backends, 1):
+        mounted = '✓ 已挂载' if b.is_available() else '✗ 未挂载'
+        marker = ' (上次)' if b.name == prev else ''
+        print(f'  {i}. {b.display_name} [{b.name}]  {mounted}{marker}')
+        if b.name == prev:
+            default_idx = i
+    print('  提示：未挂载的选项 CLI 不在 PATH，引擎会报错；可继续配置但需先安装。')
+
+    while True:
+        raw = input(f'请选择编号 [默认 {default_idx}]: ').strip()
+        if not raw:
+            return backends[default_idx - 1].name
+        try:
+            idx = int(raw)
+            if 1 <= idx <= len(backends):
+                return backends[idx - 1].name
+        except ValueError:
+            pass
+        print('输入无效，请重新选择。')
 
 
 def choose_interaction_mode():
@@ -493,13 +697,59 @@ def get_config_manual():
 #   sync_function(path, leader, worker) -> None (writes config)
 
 def _sync_hermes_env(path: Path, leader: dict, worker: dict) -> None:
-    """Sync ~/.hermes/.env — key=value format."""
+    """Sync ~/.hermes/.env — key=value format.
+
+    Safety invariants:
+      1. Never overwrite a non-empty API key with a masked placeholder
+         (``***`` or all-asterisks). If the existing .env already holds a
+         real key, we keep it unless the caller passed a *new* non-masked
+         value for the same role.
+      2. Never write an empty/masked value into a previously-empty key
+         silently — that would let a polluted runtime config wipe the
+         user's credentials. We bail with a loud error instead.
+    """
     import re as _re
     if path.exists():
         lines = path.read_text(encoding='utf-8').splitlines(keepends=True)
     else:
         lines = ['# Hermes Agent secrets\n']
-    updates = {'ANTHROPIC_API_KEY': leader['api_key'], 'ANTHROPIC_BASE_URL': leader['base_url']}
+
+    def _is_masked(v: str) -> bool:
+        if not v:
+            return False
+        if v == '*' * len(v):
+            return True
+        if len(v) <= 16 and '...' in v:
+            return True
+        return False
+
+    # Read existing values once so we can guard against clobbering real keys.
+    existing = {}
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#') or '=' not in stripped:
+            continue
+        k, v = stripped.split('=', 1)
+        existing[k.strip()] = v.strip()
+
+    def _resolve(key: str, new_val: str) -> str:
+        """Return the value to actually write, applying safety rules."""
+        cur = existing.get(key, '')
+        # Rule A: refuse to write a masked value on top of a real key.
+        if _is_masked(new_val) and cur and not _is_masked(cur):
+            print(f'  · 保留 {key}（已存在真值，拒绝用占位符覆盖）')
+            return cur
+        # Rule B: refuse to wipe a real key with an empty value (would lock
+        # the user out of their engine with no recovery hint).
+        if not new_val and cur and not _is_masked(cur):
+            print(f'  · 保留 {key}（已存在真值，跳过清空）')
+            return cur
+        return new_val or cur
+
+    updates = {
+        'ANTHROPIC_API_KEY':  _resolve('ANTHROPIC_API_KEY',  leader['api_key']),
+        'ANTHROPIC_BASE_URL': _resolve('ANTHROPIC_BASE_URL', leader['base_url']),
+    }
     for key, val in updates.items():
         pattern = _re.compile(rf'^{key}=.*$')
         found = False
@@ -584,6 +834,13 @@ def main():
     #    project. Fails fast and exits if the user's environment is misaligned.
     enforce_path_consistency()
 
+    # 1b. Detect a previously-poisoned ~/.hermes/.env. If the on-disk key
+    #     is a mask placeholder (``***``) and we have no real key in
+    #     os.environ, the engine will fail with 401. Tell the user up-front
+    #     instead of after they fill out 6 prompts. This is the recovery
+    #     hook for the "opc clobbered my key" failure mode.
+    _warn_if_masked_env()
+
     # 2. Load the previous runtime so each field can fall back to its prior value.
     prev_runtime = load_previous_runtime()
     prev_leader = prev_runtime.get('leader', {})
@@ -604,9 +861,26 @@ def main():
             'model':    prev_runtime.get('worker_model', ''),
         }
 
-    # 3. Two rounds of prompts — Leader first, then Worker.
-    leader = ask_agent_config('Leader Agent（规划/聚合大脑）', prev_leader)
-    worker = ask_agent_config('Worker Agent（执行器大脑）',  prev_worker)
+    # 3. Worker agent backend selection — comes FIRST so the field schema
+    #    below can adapt to the chosen adapter (e.g. OpenAI-format codex
+    #    only needs OPENAI_API_KEY, no base_url; ahkp-format claude needs
+    #    ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL). See ADAPTER_FIELD_SCHEMA
+    #    below. Previous value is read from prior runtime file (default
+    #    claude-code for legacy files).
+    worker_agent = choose_worker_agent(prev_runtime.get('worker_agent', '') or 'claude-code')
+
+    # 3b. Try to auto-detect usable credentials for the chosen adapter from
+    #     ~/.hermes/.env. If we find non-empty ANTHROPIC_API_KEY, propose it
+    #     as a one-tap "use detected" branch in the manual prompts so users
+    #     don't have to retype their key. The detected value is only used
+    #     as a suggestion — the user can still override.
+    schema = ADAPTER_FIELD_SCHEMA.get(worker_agent, ADAPTER_FIELD_SCHEMA['claude-code'])
+    detected = _detect_creds_for_adapter(worker_agent)
+
+    # 4. Two rounds of prompts — Leader first, then Worker. Each prompt
+    #    follows the schema for the chosen worker adapter.
+    leader = ask_agent_config('Leader Agent（规划/聚合大脑）', prev_leader, schema=schema)
+    worker = ask_agent_config('Worker Agent（执行器大脑）',  prev_worker, schema=schema)
 
     host = prompt('管理面板监听地址', prev_runtime.get('host') or '0.0.0.0')
     port = prompt('管理面板监听端口', str(prev_runtime.get('port') or '8765'))
@@ -616,6 +890,7 @@ def main():
         'config_source': 'manual (leader/worker independent)',
         'leader': leader,
         'worker': worker,
+        'worker_agent': worker_agent,
         # Legacy mirrors so other tooling reading the old keys keeps working.
         'base_url':     leader['base_url'],
         'leader_model': leader['model'],
@@ -623,6 +898,22 @@ def main():
         'host': host,
         'port': int(port),
         'cwd': cwd,
+        # New provider-aware fields (cc-switch style). start.py writes a
+        # single synthetic 'default' provider from the leader/worker prompts
+        # so the engine can pick up providers/active_provider/fallback_chain
+        # without breaking legacy readers. Operators can add more providers
+        # later via `hermes-collab config add-provider <name> ...`.
+        'providers': [
+            {
+                'name': 'default',
+                'protocol': 'anthropic',
+                'base_url': leader['base_url'],
+                'api_key': leader['api_key'],
+                'default_model': leader['model'],
+            }
+        ],
+        'active_provider': 'default',
+        'fallback_chain': ['default'],
     }
     RUNTIME_CONFIG_PATH.write_text(
         json.dumps(runtime, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -630,6 +921,17 @@ def main():
         os.chmod(RUNTIME_CONFIG_PATH, 0o600)  # contains api_keys
     except OSError:
         pass
+
+    # Use config_store for the real write so we get atomic write + backup rotation
+    # if config_store is importable (it is for any install that has the package).
+    try:
+        from hermes_collab_engine.config_store import save_with_backup as _save_with_backup
+        _backup = _save_with_backup(RUNTIME_CONFIG_PATH, runtime)
+        if _backup:
+            print(f'已备份旧 runtime 配置: {_backup}')
+    except Exception as _e:  # pragma: no cover - fallback path
+        # Best-effort: leave the original write in place.
+        print(f'⚠ config_store.save_with_backup 不可用, 保持原样: {_e}')
 
     # ── Sync agent config files ────────────────────────────────────────
     # Write leader values back to ~/.hermes/.env and ~/.claude/settings.json
@@ -651,11 +953,23 @@ def main():
     run_env['HERMES_COLLAB_WORKER_MODEL']    = worker['model']
     run_env['HERMES_COLLAB_WORKER_BASE_URL'] = worker['base_url']
     run_env['HERMES_COLLAB_WORKER_API_KEY']  = worker['api_key']
+    run_env['HERMES_COLLAB_WORKER_AGENT']    = worker_agent
+    # 2026-06-16: Cap global opencode worker concurrency to prevent 4-run storm
+    # from leaking lsp-daemon children on 4GB boxes. The server itself doesn't
+    # spawn workers, but run() invocations (CLI subprocesses from web UI) will
+    # inherit this env via engine.__init__ fallback. Default 4 is safe.
+    # Override via OPERATION_GLOBAL_MAX_CONCURRENT env (passed straight through).
+    try:
+        opc_global_max = max(1, int(os.environ.get('OPERATION_GLOBAL_MAX_CONCURRENT', '4')))
+    except (TypeError, ValueError):
+        opc_global_max = 4
+    run_env['HERMES_COLLAB_GLOBAL_MAX_CONCURRENT'] = str(opc_global_max)
 
     server_cmd = [
         str(ROOT / 'hermes-collab'), 'server', '--host', host, '--port', str(port),
         '--cwd', cwd, '--db', str(ROOT / 'data' / 'collab.sqlite3'),
         '--leader-model', leader['model'], '--worker-model', worker['model'],
+        '--agent', worker_agent,
     ]
 
     # Print summary (mask api keys).
@@ -672,13 +986,38 @@ def main():
     stop_existing_server()
     log_path = ROOT / 'data' / 'server.log'
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_file = log_path.open('a', encoding='utf-8')
+    # buffering=1 = line-buffered so a crashing engine's traceback shows up
+    # in server.log immediately, not after opc exits and flushes the file.
+    # Before this, ops would see "Traceback (most recent call last):" with
+    # no body — the actual frames were stuck in the open()'s 8KB buffer.
+    log_file = log_path.open('a', encoding='utf-8', buffering=1)
     server = subprocess.Popen(server_cmd, env=run_env, cwd=ROOT,
                               stdout=log_file, stderr=subprocess.STDOUT)
     time.sleep(1.5)
     if server.poll() is not None:
         print(f'管理面板启动失败，请查看日志：{log_path}')
         return 1
+
+    # Post-start health probe: run `hermes-collab doctor` against the
+    # runtime config so the operator can see masked keys, backup count,
+    # and provider health before they start submitting tasks.
+    try:
+        from hermes_collab_engine.cli import main as _cli_main
+        import sys as _sys
+        _saved = list(_sys.argv)
+        try:
+            _sys.argv = ['hermes-collab', 'doctor', '--config', str(RUNTIME_CONFIG_PATH)]
+            _rc = _cli_main()
+            if _rc != 0:
+                print(f'⚠ doctor 子命令返回 {_rc} — 详见上面输出')
+        finally:
+            _sys.argv = _saved
+    except SystemExit as _se:
+        # argparse uses SystemExit(2) for usage errors; we want to keep going
+        # even if doctor failed, since the dashboard itself is already up.
+        print(f'⚠ doctor 退出: code={_se.code}')
+    except Exception as _e:  # pragma: no cover - best-effort
+        print(f'⚠ doctor 调用失败: {_e}')
 
     display_host = host if host != '0.0.0.0' else '服务器IP'
     print(f'管理面板已启动：http://{display_host}:{port}')

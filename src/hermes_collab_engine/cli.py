@@ -10,6 +10,7 @@ from typing import Any
 
 from .engine import CollabEngine
 from .models import RiskPolicy, WBSNode
+from .provider import ProviderProfile
 from .server import DashboardServer
 
 LESSON_SCOPES = ("global", "project", "run", "node", "wbs-family")
@@ -84,13 +85,18 @@ def main() -> int:
     run.add_argument("--model", help="Use the same model for leader and workers")
     run.add_argument("--leader-model", help="Leader brain model for planning and aggregation")
     run.add_argument("--worker-model", help="Worker brain model for coding workers")
-    run.add_argument("--agent", default="claude-code", help="Agent backend: claude-code (default), codex, opencode, or custom")
-    run.add_argument("--concurrency", type=int, default=4)
+    run.add_argument("--agent", default="opencode", help="Agent backend: opencode (default, OMO-enhanced), claude-code, codex, hermes, or custom")
+    run.add_argument("--concurrency", type=int, default=2, help="Per-run in-flight workers (threads in run's pool)")
+    run.add_argument("--global-max-concurrent", type=int, default=4, help="Global cap on opencode worker processes across ALL runs. Prevents 4-run storm (4GB RAM death spiral).")
     run.add_argument("--timeout", type=int, default=900)
     run.add_argument("--max-retries", type=int, default=2)
     run.add_argument("--split-count", type=int, default=4)
     run.add_argument("--no-aggregate", action="store_true")
     run.add_argument("--json", action="store_true")
+    run.add_argument("--provider", help="Provider name (enables multi-provider env var mapping)")
+    run.add_argument("--provider-base-url", help="Provider API base URL (required with --provider)")
+    run.add_argument("--provider-api-key", help="Provider API key (required with --provider)")
+    run.add_argument("--provider-model", help="Provider default model (falls back to --model then env var)")
 
     server = sub.add_parser("server", help="Run management dashboard")
     server.add_argument("--host", default="127.0.0.1")
@@ -100,7 +106,7 @@ def main() -> int:
     server.add_argument("--model", help="Use the same model for leader and workers")
     server.add_argument("--leader-model", help="Leader brain model for planning and aggregation")
     server.add_argument("--worker-model", help="Worker brain model for coding workers")
-    server.add_argument("--agent", default="claude-code", help="Agent backend: claude-code (default), codex, opencode, or custom")
+    server.add_argument("--agent", default="opencode", help="Agent backend: opencode (default, OMO-enhanced), claude-code, codex, hermes, or custom")
 
     status = sub.add_parser("status", help="Show engine status")
     status.add_argument("--db", default="data/collab.sqlite3")
@@ -223,6 +229,34 @@ def main() -> int:
     redo_node.add_argument("--worker-model")
     redo_node.add_argument("--json", action="store_true")
 
+    # doctor — one-shot health check for the runtime config
+    doctor = sub.add_parser("doctor", help="Diagnose .runtime-config.json (path, perms, providers, token masking, backup count)")
+    doctor.add_argument("--config", default=".runtime-config.json", help="Path to runtime config (default: ./.runtime-config.json)")
+    doctor.add_argument("--json", action="store_true", help="Emit raw JSON instead of human-readable report")
+
+    # config show / set / add-provider — thin wrappers over config_store
+    config = sub.add_parser("config", help="Inspect and mutate .runtime-config.json")
+    config_sub = config.add_subparsers(dest="config_cmd", required=True)
+
+    config_show = config_sub.add_parser("show", help="Show current config (uses config_store.load_with_migration + diagnose)")
+    config_show.add_argument("--config", default=".runtime-config.json")
+    config_show.add_argument("--json", action="store_true")
+
+    config_set = config_sub.add_parser("set", help="Set a top-level config field (worker-model / leader-model / active_provider / worker_agent)")
+    config_set.add_argument("--config", default=".runtime-config.json")
+    config_set.add_argument("field", choices=["worker-model", "leader-model", "active-provider", "worker-agent"])
+    config_set.add_argument("value")
+    config_set.add_argument("--json", action="store_true")
+
+    config_add_provider = config_sub.add_parser("add-provider", help="Add a provider entry to the providers list")
+    config_add_provider.add_argument("--config", default=".runtime-config.json")
+    config_add_provider.add_argument("name")
+    config_add_provider.add_argument("--base-url", required=True)
+    config_add_provider.add_argument("--api-key", required=True)
+    config_add_provider.add_argument("--protocol", default="anthropic", choices=["anthropic", "openai", "gemini", "custom"])
+    config_add_provider.add_argument("--default-model", default="")
+    config_add_provider.add_argument("--json", action="store_true")
+
     setting = sub.add_parser("setting", help="Manage persistent engine settings")
     setting_sub = setting.add_subparsers(dest="setting_cmd", required=True)
     setting_get = setting_sub.add_parser("get", help="Get a setting value")
@@ -250,7 +284,21 @@ def main() -> int:
     if args.cmd == "run":
         request = Path(args.request_file).read_text(encoding="utf-8") if args.request_file else " ".join(args.request)
         model, leader_model, worker_model = _model_options(args)
-        engine = CollabEngine(args.db, args.cwd, model, leader_model=leader_model, worker_model=worker_model, agent=args.agent)
+        provider = None
+        if args.provider:
+            provider = ProviderProfile(
+                name=args.provider,
+                protocol="custom",  # CLI-specified providers default to custom
+                base_url=args.provider_base_url or "",
+                api_key=args.provider_api_key or "",
+                default_model=args.provider_model or model or "",
+            )
+        engine = CollabEngine(
+            args.db, args.cwd, model,
+            leader_model=leader_model, worker_model=worker_model,
+            agent=args.agent, provider=provider,
+            global_max_concurrent=getattr(args, 'global_max_concurrent', 4),
+        )
         result = engine.run(
             request,
             title=args.title,
@@ -553,6 +601,144 @@ def main() -> int:
             store.log(run_id, "warning", "node skipped by intervention", {"node": args.node_id, "reason": args.reason}, args.node_id)
             result = {"ok": True, "node_id": args.node_id, "run_id": run_id, "status": "failed", "reason": args.reason}
             print(json.dumps(result, ensure_ascii=False, indent=2 if args.json else None))
+            return 0
+
+    # ------------------------------------------------------------------
+    # doctor + config — config_store driven diagnostics and mutation
+    # ------------------------------------------------------------------
+    if args.cmd == "doctor":
+        from .config_store import diagnose, mask_token, load_with_migration
+        cfg_path = Path(args.config)
+        if not cfg_path.is_absolute():
+            cfg_path = Path.cwd() / cfg_path
+        diag = diagnose(cfg_path)
+        loaded = load_with_migration(cfg_path) if diag["valid_json"] else {}
+        # Augment with token-masked api_key (so user can audit without leaking)
+        masked = {}
+        for prov in loaded.get("providers", []) if isinstance(loaded.get("providers"), list) else []:
+            if isinstance(prov, dict) and "api_key" in prov:
+                pname = prov.get("name", "?")
+                masked[pname] = mask_token(prov.get("api_key", ""))
+        # Backup count
+        backup_dir = cfg_path.parent / ".backups"
+        backup_count = 0
+        if backup_dir.is_dir():
+            backup_count = sum(1 for _ in backup_dir.glob(f"{cfg_path.name}.*.bak"))
+        report = {
+            **diag,
+            "loaded_keys": sorted(list(loaded.keys())) if isinstance(loaded, dict) else [],
+            "worker_model": loaded.get("worker_model"),
+            "leader_model": loaded.get("leader_model"),
+            "active_provider": loaded.get("active_provider"),
+            "worker_agent": loaded.get("worker_agent"),
+            "fallback_chain": loaded.get("fallback_chain", []),
+            "provider_count": diag.get("provider_count", 0),
+            "provider_keys_masked": masked,
+            "backup_count": backup_count,
+        }
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            ok = "✓" if diag["valid_json"] and not diag["errors"] else "✗"
+            print(f"{ok} {cfg_path}")
+            print(f"  exists       : {diag['exists']}")
+            print(f"  permissions  : {diag['permissions'] or '-'}")
+            print(f"  size         : {diag['size_bytes']} bytes")
+            print(f"  valid_json   : {diag['valid_json']}")
+            if diag["errors"]:
+                print(f"  errors       : {diag['errors']}")
+            print(f"  worker_model : {loaded.get('worker_model', '-')}")
+            print(f"  leader_model : {loaded.get('leader_model', '-')}")
+            print(f"  worker_agent : {loaded.get('worker_agent', '-')}")
+            print(f"  active       : {loaded.get('active_provider', '-')}")
+            print(f"  fallback     : {loaded.get('fallback_chain', [])}")
+            print(f"  providers    : {diag['provider_count']} (keys masked: {len(masked)})")
+            if masked:
+                for n, m in masked.items():
+                    print(f"    {n}: {m}")
+            print(f"  backups      : {backup_count}")
+        return 0 if diag["valid_json"] and not diag["errors"] else 1
+
+    if args.cmd == "config":
+        from .config_store import load_with_migration, save_with_backup, mask_token
+        cfg_path = Path(args.config)
+        if not cfg_path.is_absolute():
+            cfg_path = Path.cwd() / cfg_path
+
+        if args.config_cmd == "show":
+            data = load_with_migration(cfg_path)
+            # Mask any api_key fields we find at the top level or inside providers
+            if isinstance(data, dict):
+                if "api_key" in data and isinstance(data["api_key"], str):
+                    data["api_key_masked"] = mask_token(data["api_key"])
+                providers = data.get("providers")
+                if isinstance(providers, list):
+                    masked_list = []
+                    for p in providers:
+                        if isinstance(p, dict) and isinstance(p.get("api_key"), str):
+                            p = dict(p)
+                            p["api_key_masked"] = mask_token(p["api_key"])
+                        masked_list.append(p)
+                    data["providers"] = masked_list
+            if args.json:
+                print(json.dumps(data, ensure_ascii=False, indent=2))
+            else:
+                print(json.dumps(data, ensure_ascii=False, indent=2))
+            return 0
+
+        if args.config_cmd == "set":
+            data = load_with_migration(cfg_path)
+            key_map = {
+                "worker-model": "worker_model",
+                "leader-model": "leader_model",
+                "active-provider": "active_provider",
+                "worker-agent": "worker_agent",
+            }
+            target = key_map[args.field]
+            old = data.get(target)
+            data[target] = args.value
+            backup = save_with_backup(cfg_path, data)
+            result = {"ok": True, "field": target, "old": old, "new": args.value, "backup": str(backup) if backup else None}
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print(f"set {target}: {old!r} -> {args.value!r}")
+                if backup:
+                    print(f"backup saved: {backup}")
+            return 0
+
+        if args.config_cmd == "add-provider":
+            data = load_with_migration(cfg_path)
+            providers = data.get("providers")
+            if not isinstance(providers, list):
+                providers = []
+            # Remove any existing entry with same name (overwrite semantics)
+            providers = [p for p in providers if not (isinstance(p, dict) and p.get("name") == args.name)]
+            new_prov = {
+                "name": args.name,
+                "protocol": args.protocol,
+                "base_url": args.base_url,
+                "api_key": args.api_key,
+            }
+            if args.default_model:
+                new_prov["default_model"] = args.default_model
+            providers.append(new_prov)
+            data["providers"] = providers
+            if not data.get("active_provider"):
+                data["active_provider"] = args.name
+            backup = save_with_backup(cfg_path, data)
+            masked_view = dict(new_prov)
+            masked_view["api_key"] = mask_token(args.api_key)
+            result = {"ok": True, "provider": masked_view, "total_providers": len(providers), "active_provider": data.get("active_provider"), "backup": str(backup) if backup else None}
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print(f"added provider {args.name!r} ({args.protocol})")
+                print(f"  base_url     : {args.base_url}")
+                print(f"  api_key      : {mask_token(args.api_key)}")
+                print(f"  total        : {len(providers)}")
+                if backup:
+                    print(f"  backup       : {backup}")
             return 0
 
     return 1

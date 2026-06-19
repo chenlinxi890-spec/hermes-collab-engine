@@ -1,0 +1,48 @@
+{
+  "mcpServers": {
+    "ferris-search": {
+      "command": "ferris-search",
+      "args": [],
+      "env": {},
+      "tools": [
+        "web_search",
+        "fetch_web_content",
+        "fetch_csdn_article",
+        "fetch_juejin_article",
+        "fetch_zhihu_article",
+        "fetch_linuxdo_article",
+        "fetch_github_readme"
+      ]
+    },
+    "baidu-search": {
+      "command": "npx",
+      "args": ["-y", "@alex.ss/mcp-server-baidu-search"],
+      "env": {},
+      "tools": [
+        "baidu_search"
+      ]
+    },
+    "open-websearch": {
+      "command": "npx",
+      "args": ["-y", "open-websearch@latest"],
+      "env": {
+        "MODE": "stdio",
+        "DEFAULT_SEARCH_ENGINE": "bing"
+      },
+      "tools": [
+        "search",
+        "fetch_web"
+      ]
+    },
+    "daisyui": {
+      "command": "https://gitmcp.io/saadeghi/daisyui",
+      "args": [],
+      "env": {},
+      "tools": [
+        "get_component_docs",
+        "list_components",
+        "search_components"
+      ]
+    }
+  }
+}

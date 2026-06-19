@@ -133,6 +133,21 @@ chmod +x "$INSTALL_DIR/start.py"
 write_launcher "$BIN_DIR/hermes-collab" -m src.hermes_collab_engine.cli
 write_launcher "$BIN_DIR/opc" start.py
 
+echo "==> 构建协议代理 (proxy/)"
+PROXY_BINARY="$INSTALL_DIR/proxy/opencode-proxy"
+if command -v go >/dev/null 2>&1; then
+  echo "  发现 Go，正在编译协议代理..."
+  if (cd "$INSTALL_DIR/proxy" && go build -o opencode-proxy ./cmd/server 2>/dev/null); then
+    echo "  ✓ Go 代理编译成功: $PROXY_BINARY"
+  else
+    echo "  ⚠ Go 编译失败，使用 Python 代理 (proxy.py) 作为备用"
+  fi
+else
+  echo "  · 未安装 Go，使用 Python 代理 (proxy.py) 作为备用"
+  echo "  如需 Go 代理性能优化，请手动安装 Go 后执行:"
+  echo "    cd '$INSTALL_DIR/proxy' && go build -o opencode-proxy ./cmd/server"
+fi
+
 if ! command -v claude >/dev/null 2>&1; then
   echo ""
   echo "提示: 未找到 Claude Code CLI: claude"
@@ -146,6 +161,8 @@ if ! command -v hermes >/dev/null 2>&1; then
   echo "本脚本不会自动执行远程安装脚本；如需 launcher 模式，请按官方文档安装 Hermes。"
 fi
 
+echo ""
+echo "其他 Worker Agent (opencode, openclaw, cursor 等) 可通过 opc add-agent <name> 动态添加"
 echo ""
 echo "==> 安装完成"
 echo "仓库: $INSTALL_DIR"

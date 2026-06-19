@@ -13,6 +13,9 @@ ROOT = Path(__file__).resolve().parent
 HERMES_DIR = Path.home() / '.hermes'
 CLAUDE_DIR = Path.home() / '.claude'
 
+PROXY_BINARY = ROOT / 'proxy' / 'opencode-proxy'
+PROXY_PORT = 18080
+
 VERSION = 'v5.0'
 GITHUB_URL = 'https://github.com/lpc0387/hermes-collab-engine'
 TAGLINE_ZH = '多 Agent 协同引擎 · Leader 拆解 · Worker 并行 · 面板可视化'
@@ -409,6 +412,54 @@ def _mask(token: str) -> str:
 # The user's "go" / "zen" plan concept: "go" plan = key-only (model includes
 # gateway info), "zen" plan = key + base_url. We honor that here.
 ADAPTER_FIELD_SCHEMA = {
+    'openclaw': {
+        "fields": [
+            "api_key",
+            "model"
+        ],
+        "optional_fields": [],
+        "format": "openai",
+        "env_var": "OPENCLAW_API_KEY",
+        "base_url_env": ""
+    },
+
+    'copilot': {
+        "fields": [
+            "api_key",
+            "model"
+        ],
+        "optional_fields": [
+            "base_url"
+        ],
+        "format": "openai",
+        "env_var": "OPENAI_API_KEY",
+        "base_url_env": "OPENAI_BASE_URL"
+    },
+
+    'windsurf': {
+        "fields": [
+            "api_key",
+            "model"
+        ],
+        "optional_fields": [],
+        "format": "openai",
+        "env_var": "OPENAI_API_KEY",
+        "base_url_env": ""
+    },
+
+    'cursor': {
+        "fields": [
+            "api_key",
+            "model"
+        ],
+        "optional_fields": [
+            "base_url"
+        ],
+        "format": "openai",
+        "env_var": "CURSOR_API_KEY",
+        "base_url_env": "CURSOR_BASE_URL"
+    },
+
     'claude-code': {
         'fields': ['base_url', 'api_key', 'model'],
         'optional_fields': ['base_url'],  # Anthropic API can default
@@ -746,9 +797,12 @@ def _sync_hermes_env(path: Path, leader: dict, worker: dict) -> None:
             return cur
         return new_val or cur
 
+    ocg_base = leader['base_url'].rstrip('/') + '/v1'
     updates = {
-        'ANTHROPIC_API_KEY':  _resolve('ANTHROPIC_API_KEY',  leader['api_key']),
-        'ANTHROPIC_BASE_URL': _resolve('ANTHROPIC_BASE_URL', leader['base_url']),
+        'ANTHROPIC_API_KEY':     _resolve('ANTHROPIC_API_KEY',     leader['api_key']),
+        'ANTHROPIC_BASE_URL':    _resolve('ANTHROPIC_BASE_URL',    leader['base_url']),
+        'OPENCODE_GO_API_KEY':   _resolve('OPENCODE_GO_API_KEY',   leader['api_key']),
+        'OPENCODE_GO_BASE_URL':  _resolve('OPENCODE_GO_BASE_URL',  ocg_base),
     }
     for key, val in updates.items():
         pattern = _re.compile(rf'^{key}=.*$')
@@ -797,12 +851,34 @@ def _sync_claude_settings(path: Path, leader: dict, worker: dict) -> None:
     print(f'  ✓ 已同步 → {path}')
 
 
+def _sync_hermes_config_yaml(path: Path, leader: dict, worker: dict) -> None:
+    if not path.exists():
+        return
+    new_model = (leader.get('model') or '').strip()
+    if '/' in new_model:
+        new_model = new_model.rsplit('/', 1)[-1]
+    if not new_model:
+        return
+    text = path.read_text(encoding='utf-8')
+    updated = re.sub(
+        r'^(\s*default:\s*).*',
+        rf'\1{new_model}',
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if updated != text:
+        path.write_text(updated, encoding='utf-8')
+        print(f'  ✓ 已同步 model.default → {new_model} → {path}')
+
+
 # Agent config registry: (name, path_builder, sync_fn)
 # path_builder receives (leader, worker) and returns the config file Path or None.
 # To add a new agent, append a tuple here.
 AGENT_CONFIG_REGISTRY = [
-    ('hermes', lambda l, w: HERMES_DIR / '.env', _sync_hermes_env),
-    ('claude', lambda l, w: CLAUDE_DIR / 'settings.json', _sync_claude_settings),
+    ('hermes',    lambda l, w: HERMES_DIR / '.env',       _sync_hermes_env),
+    ('hermes-yaml', lambda l, w: HERMES_DIR / 'config.yaml', _sync_hermes_config_yaml),
+    ('claude',    lambda l, w: CLAUDE_DIR / 'settings.json', _sync_claude_settings),
 ]
 
 
@@ -823,31 +899,185 @@ def sync_agent_configs(leader: dict, worker: dict) -> None:
 
 
 def stop_existing_server():
-    subprocess.run(['pkill', '-f', 'src.hermes_collab_engine.cli server'],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    """Stop any previous engine server so the new one can bind the port.
+
+    Replaces the prior `pkill -f 'src.hermes_collab_engine.cli server'`, which
+    had two failure modes that would let a new opc launch die with EADDRINUSE
+    while the user only saw `Address already in use` in server.log:
+
+      1. **Stopped (T) processes** — pkill sends SIGTERM by default, but a
+         SIGSTOPed / SIGTSTOPed / kernel-paused process queues SIGTERM
+         without running its handler. pkill then returns rc=1 ("no signal
+         delivered") and the port-holder lives on. Real-world triggers:
+         Ctrl-Z in a debug session, container freezer (cgroup `FROZEN`),
+         gdb attaching with `stop()`. We saw this exact failure on the
+         8765 listener (pid 41051, state Tl, wchan=do_signal_stop).
+
+      2. **Matching** — `pkill -f` matches against the process *command
+         line*; an engine spawned via `python3 -m src.hermes_collab_engine.cli
+         server` happens to include the substring, but a process that was
+         started via `hermes-collab server ...` (the canonical entrypoint)
+         does NOT include the substring. Fix: use `pgrep -f` to *find* the
+         pids, then signal each pid explicitly so we control the order
+         (CONT → TERM → KILL) and don't depend on pkill's matching quirks.
+
+    Order of operations per matching pid:
+        SIGCONT  — wake any stopped process so it can receive the next signal
+        SIGTERM  — ask politely, give it 2 s to exit and release the port
+        SIGKILL  — last resort if SIGTERM didn't take effect
+    """
+    import signal as _sig
+
+    pattern = 'src.hermes_collab_engine.cli server'
+    try:
+        result = subprocess.run(
+            ['pgrep', '-f', pattern],
+            capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        # pgrep missing on PATH — fall back to the old pkill behavior so we
+        # at least attempt the cleanup rather than silently leaking the port.
+        subprocess.run(['pkill', '-f', pattern],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    pids = [int(line) for line in result.stdout.split() if line.strip().isdigit()]
+    if not pids:
+        return
+
+    for pid in pids:
+        try:
+            # Wake first so the next signal can be processed promptly even
+            # if the process is currently in T (stopped) state.
+            os.kill(pid, _sig.SIGCONT)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            # Another user's process — skip rather than crashing opc.
+            continue
+        except OSError:
+            continue
+
+    # SIGTERM pass — covers the common case (engine received the signal,
+    # runs its atexit handler, closes the listening socket).
+    for pid in pids:
+        try:
+            os.kill(pid, _sig.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        alive = [pid for pid in pids
+                 if _pid_alive(pid)]
+        if not alive:
+            break
+        time.sleep(0.1)
+
+    # SIGKILL sweep for any stragglers (defunct-but-port-holding, kernel
+    # freezer refusing SIGTERM, etc.). The port must be free for the new
+    # server to bind.
+    for pid in pids:
+        if not _pid_alive(pid):
+            continue
+        try:
+            os.kill(pid, _sig.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    # Give the kernel a moment to actually release the socket.
+    time.sleep(0.2)
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True iff `pid` is still running (any state except gone)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists but owned by someone else — treat as alive for cleanup.
+        return True
+    return True
+
+
+# -- Proxy lifecycle (Go binary from proxy/ directory / Python fallback) --
+
+_ADAPTERS_NEED_PROXY = {'claude-code', 'codex', 'hermes'}
+
+def _start_proxy(upstream_token: str, upstream_base_url: str = ''):
+    proxy_path = PROXY_BINARY
+    if not proxy_path.exists():
+        print(f'  ⚠ Go 代理二进制不存在: {proxy_path}')
+        print(f'  尝试使用 Python 代理 (proxy.py) ...')
+        return _start_python_proxy(upstream_token, upstream_base_url)
+    proxy_env = os.environ.copy()
+    proxy_env['OPCODE_UPSTREAM_TOKEN'] = upstream_token
+    if upstream_base_url:
+        proxy_env['OPCODE_UPSTREAM_BASE'] = upstream_base_url
+    proxy_env['OPCODE_LISTEN'] = f':{PROXY_PORT}'
+    proxy_log = ROOT / 'data' / 'proxy.log'
+    proxy_log.parent.mkdir(parents=True, exist_ok=True)
+    pf = proxy_log.open('a', encoding='utf-8', buffering=1)
+    proc = subprocess.Popen([str(proxy_path)], env=proxy_env, stdout=pf, stderr=subprocess.STDOUT)
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        print(f'  ⚠ Go 代理启动失败，请查看日志: {proxy_log}')
+        print(f'  尝试使用 Python 代理 (proxy.py) ...')
+        pf.close()
+        return _start_python_proxy(upstream_token, upstream_base_url)
+    print(f'  ✓ Go 协议代理已启动 → http://127.0.0.1:{PROXY_PORT}')
+    return (proc, pf)
+
+
+def _start_python_proxy(upstream_token: str, upstream_base_url: str = '') -> tuple | None:
+    proxy_py = ROOT / 'proxy.py'
+    if not proxy_py.exists():
+        print(f'  ⚠ Python 代理脚本不存在: {proxy_py}')
+        return None
+    proxy_env = os.environ.copy()
+    proxy_env['PROXY_API_KEY'] = upstream_token
+    if upstream_base_url:
+        proxy_env['PROXY_TARGET'] = upstream_base_url.rstrip('/') + '/v1'
+    proxy_env['PROXY_PORT'] = str(PROXY_PORT)
+    proxy_env['PROXY_CONFIG'] = str(RUNTIME_CONFIG_PATH)
+    proxy_log = ROOT / 'data' / 'proxy.log'
+    proxy_log.parent.mkdir(parents=True, exist_ok=True)
+    pf = proxy_log.open('a', encoding='utf-8', buffering=1)
+    proc = subprocess.Popen(
+        [sys.executable, str(proxy_py)],
+        env=proxy_env, stdout=pf, stderr=subprocess.STDOUT,
+    )
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        print(f'  ⚠ Python 代理启动失败，请查看日志: {proxy_log}')
+        pf.close()
+        return None
+    print(f'  ✓ Python 协议代理已启动 → http://127.0.0.1:{PROXY_PORT}')
+    return (proc, pf)
+
+
+def _stop_process(proc, log_file):
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    log_file.close()
 
 
 def main():
+    import sys as _sys
+    _quick = '--quick' in _sys.argv or '-q' in _sys.argv
+
     print_banner()
 
-    # 1. Path-consistency invariant — agent config dirs must live alongside the
-    #    project. Fails fast and exits if the user's environment is misaligned.
     enforce_path_consistency()
-
-    # 1b. Detect a previously-poisoned ~/.hermes/.env. If the on-disk key
-    #     is a mask placeholder (``***``) and we have no real key in
-    #     os.environ, the engine will fail with 401. Tell the user up-front
-    #     instead of after they fill out 6 prompts. This is the recovery
-    #     hook for the "opc clobbered my key" failure mode.
     _warn_if_masked_env()
 
-    # 2. Load the previous runtime so each field can fall back to its prior value.
     prev_runtime = load_previous_runtime()
     prev_leader = prev_runtime.get('leader', {})
     prev_worker = prev_runtime.get('worker', {})
 
-    # Backfill from older flat-format runtime files (pre-v4.6) so first-run
-    # after upgrade still gets useful "previous values".
     if not prev_leader and prev_runtime.get('base_url'):
         prev_leader = {
             'base_url': prev_runtime.get('base_url', ''),
@@ -861,96 +1091,93 @@ def main():
             'model':    prev_runtime.get('worker_model', ''),
         }
 
-    # 3. Worker agent backend selection — comes FIRST so the field schema
-    #    below can adapt to the chosen adapter (e.g. OpenAI-format codex
-    #    only needs OPENAI_API_KEY, no base_url; ahkp-format claude needs
-    #    ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL). See ADAPTER_FIELD_SCHEMA
-    #    below. Previous value is read from prior runtime file (default
-    #    claude-code for legacy files).
-    worker_agent = choose_worker_agent(prev_runtime.get('worker_agent', '') or 'claude-code')
+    runtime_exists = bool(prev_runtime.get('leader') and prev_runtime['leader'].get('api_key'))
 
-    # 3b. Try to auto-detect usable credentials for the chosen adapter from
-    #     ~/.hermes/.env. If we find non-empty ANTHROPIC_API_KEY, propose it
-    #     as a one-tap "use detected" branch in the manual prompts so users
-    #     don't have to retype their key. The detected value is only used
-    #     as a suggestion — the user can still override.
-    schema = ADAPTER_FIELD_SCHEMA.get(worker_agent, ADAPTER_FIELD_SCHEMA['claude-code'])
-    detected = _detect_creds_for_adapter(worker_agent)
-
-    # 4. Two rounds of prompts — Leader first, then Worker. Each prompt
-    #    follows the schema for the chosen worker adapter.
-    leader = ask_agent_config('Leader Agent（规划/聚合大脑）', prev_leader, schema=schema)
-    worker = ask_agent_config('Worker Agent（执行器大脑）',  prev_worker, schema=schema)
-
-    host = prompt('管理面板监听地址', prev_runtime.get('host') or '0.0.0.0')
-    port = prompt('管理面板监听端口', str(prev_runtime.get('port') or '8765'))
-    cwd  = prompt('协同任务默认工作目录', prev_runtime.get('cwd') or str(Path.home()))
-
-    runtime = {
-        'config_source': 'manual (leader/worker independent)',
-        'leader': leader,
-        'worker': worker,
-        'worker_agent': worker_agent,
-        # Legacy mirrors so other tooling reading the old keys keeps working.
-        'base_url':     leader['base_url'],
-        'leader_model': leader['model'],
-        'worker_model': worker['model'],
-        'host': host,
-        'port': int(port),
-        'cwd': cwd,
-        # New provider-aware fields (cc-switch style). start.py writes a
-        # single synthetic 'default' provider from the leader/worker prompts
-        # so the engine can pick up providers/active_provider/fallback_chain
-        # without breaking legacy readers. Operators can add more providers
-        # later via `hermes-collab config add-provider <name> ...`.
-        'providers': [
-            {
-                'name': 'default',
-                'protocol': 'anthropic',
-                'base_url': leader['base_url'],
-                'api_key': leader['api_key'],
+    if _quick and runtime_exists:
+        leader = prev_runtime['leader']
+        worker = prev_runtime.get('worker', leader)
+        worker_agent = prev_runtime.get('worker_agent', 'opencode')
+        host = prev_runtime.get('host', '0.0.0.0')
+        port = prev_runtime.get('port', 8765)
+        cwd = prev_runtime.get('cwd', str(Path.home()))
+        runtime = prev_runtime
+        print('使用已有配置，快速启动...\n')
+    else:
+        worker_agent = choose_worker_agent(prev_runtime.get('worker_agent', '') or 'claude-code')
+        schema = ADAPTER_FIELD_SCHEMA.get(worker_agent, ADAPTER_FIELD_SCHEMA['claude-code'])
+        leader = ask_agent_config('Leader Agent（规划/聚合大脑）', prev_leader, schema=schema)
+        worker = ask_agent_config('Worker Agent（执行器大脑）',  prev_worker, schema=schema)
+        host = prompt('管理面板监听地址', prev_runtime.get('host') or '0.0.0.0')
+        port = prompt('管理面板监听端口', str(prev_runtime.get('port') or '8765'))
+        cwd  = prompt('协同任务默认工作目录', prev_runtime.get('cwd') or str(Path.home()))
+        runtime = {
+            'config_source': 'manual (single config)',
+            'leader': leader, 'worker': worker, 'worker_agent': worker_agent,
+            'base_url': leader['base_url'], 'leader_model': leader['model'],
+            'worker_model': worker['model'], 'host': host, 'port': int(port), 'cwd': cwd,
+            'providers': [{
+                'name': 'default', 'protocol': 'anthropic',
+                'base_url': leader['base_url'], 'api_key': leader['api_key'],
                 'default_model': leader['model'],
-            }
-        ],
-        'active_provider': 'default',
-        'fallback_chain': ['default'],
-    }
-    RUNTIME_CONFIG_PATH.write_text(
-        json.dumps(runtime, ensure_ascii=False, indent=2), encoding='utf-8')
-    try:
-        os.chmod(RUNTIME_CONFIG_PATH, 0o600)  # contains api_keys
-    except OSError:
-        pass
+            }],
+            'active_provider': 'default', 'fallback_chain': ['default'],
+        }
+        RUNTIME_CONFIG_PATH.write_text(
+            json.dumps(runtime, ensure_ascii=False, indent=2), encoding='utf-8')
+        try:
+            os.chmod(RUNTIME_CONFIG_PATH, 0o600)
+        except OSError:
+            pass
+        try:
+            from hermes_collab_engine.config_store import save_with_backup as _save_with_backup
+            _backup = _save_with_backup(RUNTIME_CONFIG_PATH, runtime)
+            if _backup:
+                print(f'已备份旧 runtime 配置: {_backup}')
+        except Exception as _e:
+            print(f'⚠ config_store.save_with_backup 不可用, 保持原样: {_e}')
 
-    # Use config_store for the real write so we get atomic write + backup rotation
-    # if config_store is importable (it is for any install that has the package).
-    try:
-        from hermes_collab_engine.config_store import save_with_backup as _save_with_backup
-        _backup = _save_with_backup(RUNTIME_CONFIG_PATH, runtime)
-        if _backup:
-            print(f'已备份旧 runtime 配置: {_backup}')
-    except Exception as _e:  # pragma: no cover - fallback path
-        # Best-effort: leave the original write in place.
-        print(f'⚠ config_store.save_with_backup 不可用, 保持原样: {_e}')
-
-    # ── Sync agent config files ────────────────────────────────────────
-    # Write leader values back to ~/.hermes/.env and ~/.claude/settings.json
-    # so that agent tools (Hermes CLI, Claude Code) pick up the new config
-    # without needing opc as an intermediary.
     sync_agent_configs(leader, worker)
 
-    # Build subprocess env. Leader values drive the env vars (Hermes CLI inherits
-    # these); worker values are passed via HERMES_COLLAB_WORKER_* and CLI flags so
-    # the engine can split leader/worker traffic onto different keys/base_urls.
+    # ── Provider prefix for OpenCode ──────────────────────────────────
+    # OpenCode requires the model flag to carry a provider prefix (e.g.
+    # "opencode-go/deepseek-v4-flash") so it knows which backend to use.
+    # If the agent is opencode, automatically prepend the prefix unless
+    # the model already carries one.  This mirrors how opencode-go's own
+    # proxy layer handles protocol forwarding automatically.
+    MODEL_PREFIX_OPENCODE = "opencode-go/"
+    if worker_agent == "opencode":
+        if not leader['model'].startswith(MODEL_PREFIX_OPENCODE):
+            leader_model_explicit = MODEL_PREFIX_OPENCODE + leader['model']
+        else:
+            leader_model_explicit = leader['model']
+        if not worker['model'].startswith(MODEL_PREFIX_OPENCODE):
+            worker_model_explicit = MODEL_PREFIX_OPENCODE + worker['model']
+        else:
+            worker_model_explicit = worker['model']
+    else:
+        leader_model_explicit = leader['model']
+        worker_model_explicit = worker['model']
+
+    proxy_proc = None
+    proxy_log_file = None
+    if worker_agent in _ADAPTERS_NEED_PROXY:
+        proxy_result = _start_proxy(worker['api_key'], worker.get('base_url', ''))
+        if proxy_result is not None:
+            proxy_proc, proxy_log_file = proxy_result
+            worker['base_url'] = f'http://127.0.0.1:{PROXY_PORT}'
+            print(f'  Worker BaseURL 已重定向至协议代理 → {worker["base_url"]}')
+
     run_env = os.environ.copy()
-    run_env['ANTHROPIC_AUTH_TOKEN'] = leader['api_key']
-    run_env['ANTHROPIC_API_KEY']    = leader['api_key']
-    run_env['ANTHROPIC_BASE_URL']   = leader['base_url']
-    run_env['ANTHROPIC_MODEL']      = leader['model']
-    run_env['HERMES_COLLAB_LEADER_MODEL']    = leader['model']
+    run_env['ANTHROPIC_AUTH_TOKEN']    = leader['api_key']
+    run_env['ANTHROPIC_API_KEY']       = leader['api_key']
+    run_env['ANTHROPIC_BASE_URL']      = leader['base_url']
+    run_env['ANTHROPIC_MODEL']         = leader_model_explicit
+    run_env['OPENCODE_GO_API_KEY']     = leader['api_key']
+    run_env['OPENCODE_GO_BASE_URL']    = leader['base_url'].rstrip('/') + '/v1'
+    run_env['HERMES_COLLAB_LEADER_MODEL']    = leader_model_explicit
     run_env['HERMES_COLLAB_LEADER_BASE_URL'] = leader['base_url']
     run_env['HERMES_COLLAB_LEADER_API_KEY']  = leader['api_key']
-    run_env['HERMES_COLLAB_WORKER_MODEL']    = worker['model']
+    run_env['HERMES_COLLAB_WORKER_MODEL']    = worker_model_explicit
     run_env['HERMES_COLLAB_WORKER_BASE_URL'] = worker['base_url']
     run_env['HERMES_COLLAB_WORKER_API_KEY']  = worker['api_key']
     run_env['HERMES_COLLAB_WORKER_AGENT']    = worker_agent
@@ -968,7 +1195,7 @@ def main():
     server_cmd = [
         str(ROOT / 'hermes-collab'), 'server', '--host', host, '--port', str(port),
         '--cwd', cwd, '--db', str(ROOT / 'data' / 'collab.sqlite3'),
-        '--leader-model', leader['model'], '--worker-model', worker['model'],
+        '--leader-model', leader_model_explicit, '--worker-model', worker_model_explicit,
         '--agent', worker_agent,
     ]
 
@@ -1023,8 +1250,11 @@ def main():
     print(f'管理面板已启动：http://{display_host}:{port}')
     print(f'服务日志：{log_path}')
 
-    interaction_mode = choose_interaction_mode()
-    hermes_cmd = ['hermes', '--provider', 'anthropic', '--model', leader_model]
+    if _quick:
+        interaction_mode = 'web'
+    else:
+        interaction_mode = choose_interaction_mode()
+    hermes_cmd = ['hermes']
 
     try:
         if interaction_mode == 'web':
@@ -1051,9 +1281,19 @@ def main():
         except subprocess.TimeoutExpired:
             server.kill()
         log_file.close()
+        if proxy_proc:
+            print('正在停止协议代理...')
+            _stop_process(proxy_proc, proxy_log_file)
         print('已退出。')
     return 0
 
 
 if __name__ == '__main__':
+    import sys as _sys
+    if len(_sys.argv) >= 3 and _sys.argv[1] == 'add-agent':
+        _sys.path.insert(0, str(ROOT / 'src'))
+        _saved = list(_sys.argv)
+        _sys.argv = [_sys.argv[0]] + _sys.argv[2:]
+        from hermes_collab_engine.add_agent import main as _add_main
+        raise SystemExit(_add_main())
     raise SystemExit(main())

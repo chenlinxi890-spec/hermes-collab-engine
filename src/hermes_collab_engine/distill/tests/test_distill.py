@@ -21,7 +21,15 @@ from hermes_collab_engine.distill import extractor, memory_writer, skill_writer
 
 
 def _seed_db(path: Path) -> None:
-    """Create a minimal engine schema with one day of activity."""
+    """Create a minimal engine schema with one day of activity.
+
+    Timestamps are inserted explicitly (not via CURRENT_TIMESTAMP) using
+    the *local* date, so the extractor — which filters with
+    ``date(created_at, 'localtime') = date('now', 'localtime')`` — sees
+    the rows as "today" regardless of the UTC vs local-time skew the
+    test machine happens to have. (bug fix 2026-06-17; the test was
+    flaky on UTC-offset machines.)
+    """
     conn = sqlite3.connect(str(path))
     conn.executescript(
         """
@@ -54,20 +62,25 @@ def _seed_db(path: Path) -> None:
         """
     )
     # Today: 2 lessons, 1 failed run, 1 error log
+    # Use local-time stamps so the extractor's "today" filter matches
+    # regardless of the host's UTC offset.
+    today_local = (
+        "datetime('now','localtime')"  # SQL expression evaluated on insert
+    )
     conn.execute(
-        "INSERT INTO lessons(scope,category,lesson) VALUES(?,?,?)",
+        f"INSERT INTO lessons(scope,category,lesson,created_at) VALUES(?,?,?,{today_local})",
         ("global", "planning", "Use fewer WBS nodes for small tasks"),
     )
     conn.execute(
-        "INSERT INTO lessons(scope,category,lesson) VALUES(?,?,?)",
+        f"INSERT INTO lessons(scope,category,lesson,created_at) VALUES(?,?,?,{today_local})",
         ("global", "watchdog", "Cancel hung futures before they hit the timeout"),
     )
     conn.execute(
-        "INSERT INTO runs(id,title,status) VALUES(?,?,?)",
+        f"INSERT INTO runs(id,title,status,created_at) VALUES(?,?,?,{today_local})",
         ("run_abc", "test task", "failed"),
     )
     conn.execute(
-        "INSERT INTO logs(run_id,level,message) VALUES(?,?,?)",
+        f"INSERT INTO logs(run_id,level,message,created_at) VALUES(?,?,?,{today_local})",
         ("run_abc", "error", "boom"),
     )
     conn.commit()

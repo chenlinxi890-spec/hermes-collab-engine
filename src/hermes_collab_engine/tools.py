@@ -171,6 +171,16 @@ _BUILTIN_PROFILES = [
         priority=2,
         keywords=["mcp", "tool", "external context", "read-only"],
     ),
+    ToolProfile(
+        name="browser-automation",
+        display_name="Browser Automation",
+        category="automation",
+        description="Control a headless Chrome browser via intent DSL for UI testing, screen capture, and form automation.",
+        allowed_tools=["Bash(python3 -c *GuidedRunner*)"],
+        applicable_node_types=["implementation", "verification", "debugging"],
+        priority=2,
+        keywords=["browser", "chrome", "automation", "screenshot", "ui test", "web test"],
+    ),
 ]
 
 

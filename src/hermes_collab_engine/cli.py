@@ -88,7 +88,7 @@ def main() -> int:
     run.add_argument("--agent", default="opencode", help="Agent backend: opencode (default, OMO-enhanced), claude-code, codex, hermes, or custom")
     run.add_argument("--concurrency", type=int, default=2, help="Per-run in-flight workers (threads in run's pool)")
     run.add_argument("--global-max-concurrent", type=int, default=4, help="Global cap on opencode worker processes across ALL runs. Prevents 4-run storm (4GB RAM death spiral).")
-    run.add_argument("--timeout", type=int, default=900)
+    run.add_argument("--timeout", type=int, default=86400)
     run.add_argument("--max-retries", type=int, default=2)
     run.add_argument("--split-count", type=int, default=4)
     run.add_argument("--no-aggregate", action="store_true")
@@ -212,6 +212,27 @@ def main() -> int:
     tools_cmd.add_argument("--task", default="", help="Task text used with --node-type selection")
     tools_cmd.add_argument("--json", action="store_true")
 
+    mcp_server = sub.add_parser("mcp-server", help="Manage registered MCP servers")
+    mcp_server_sub = mcp_server.add_subparsers(dest="mcp_server_cmd", required=True)
+    mcp_list = mcp_server_sub.add_parser("list", help="List registered MCP servers")
+    mcp_list.add_argument("--db", default="data/collab.sqlite3")
+    mcp_list.add_argument("--json", action="store_true")
+    mcp_add = mcp_server_sub.add_parser("add", help="Register a new MCP server")
+    mcp_add.add_argument("--db", default="data/collab.sqlite3")
+    mcp_add.add_argument("--name", required=True, help="Server name [a-zA-Z0-9_-]")
+    mcp_add.add_argument("--command", required=True, help="Executable command")
+    mcp_add.add_argument("--args", default="", help="Space-separated command arguments")
+    mcp_add.add_argument("--env", default="{}", help="JSON object of environment variables")
+    mcp_add.add_argument("--tools", default="", help="Comma-separated tool names")
+    mcp_add.add_argument("--description", default="", help="Server description")
+    mcp_add.add_argument("--display-name", default="", help="Human-readable display name")
+    mcp_add.add_argument("--capabilities", default='["*"]', help="JSON array of capability tags")
+    mcp_add.add_argument("--json", action="store_true")
+    mcp_remove = mcp_server_sub.add_parser("remove", help="Remove a registered MCP server")
+    mcp_remove.add_argument("--db", default="data/collab.sqlite3")
+    mcp_remove.add_argument("--name", required=True, help="Server name to remove")
+    mcp_remove.add_argument("--json", action="store_true")
+
     verify_v45 = sub.add_parser("verify-v45", help="Legacy alias for verify-release")
     verify_v45.add_argument("--json", action="store_true")
 
@@ -279,6 +300,9 @@ def main() -> int:
     risk_policy_set.add_argument("--medium", type=_policy_action)
     risk_policy_set.add_argument("--high", type=_policy_action)
     risk_policy_set.add_argument("--checkpoint-timeout", type=int)
+
+    python_compat = sub.add_parser("python-compat", help="Check Python version feature compatibility (3.13+ feature detection)")
+    python_compat.add_argument("--json", action="store_true")
 
     args = parser.parse_args()
     if args.cmd == "run":
@@ -372,6 +396,83 @@ def main() -> int:
                 mcp = " mcp" if profile.mcp_tools else ""
                 print(f"  {profile.name:22s} p{profile.priority} {profile.category:12s}{mcp:4s} [{node_types}] {profile.display_name}")
         return 0
+
+    if args.cmd == "mcp-server":
+        from .store import CollabStore
+        from .registry import get_unified_registry
+        store = CollabStore(args.db)
+        registry = get_unified_registry(store=store)
+
+        if args.mcp_server_cmd == "list":
+            servers = registry.list_mcp_servers()
+            if args.json:
+                print(json.dumps(servers, ensure_ascii=False, indent=2))
+            else:
+                if not servers:
+                    print("No MCP servers registered.")
+                else:
+                    print(f"MCP servers ({len(servers)}):")
+                    for srv in servers:
+                        tools_str = ", ".join(t["tool_name"] for t in srv["tools"])
+                        print(f"  {srv['server_name']:24s} tools=[{tools_str}] endpoint={srv['endpoint']}")
+            return 0
+
+        if args.mcp_server_cmd == "add":
+            import json as _json
+            name = args.name
+            command = args.command
+            args_list = [a for a in args.args.split() if a] if args.args else []
+            try:
+                env = _json.loads(args.env) if isinstance(args.env, str) else args.env
+                if not isinstance(env, dict):
+                    env = {}
+            except _json.JSONDecodeError:
+                print(json.dumps({"ok": False, "error": "invalid --env JSON"}, ensure_ascii=False))
+                return 2
+            tools_list = [t.strip() for t in args.tools.split(",") if t.strip()] if args.tools else []
+            try:
+                capabilities = _json.loads(args.capabilities) if isinstance(args.capabilities, str) else args.capabilities
+                if not isinstance(capabilities, list):
+                    capabilities = ["*"]
+            except _json.JSONDecodeError:
+                print(json.dumps({"ok": False, "error": "invalid --capabilities JSON"}, ensure_ascii=False))
+                return 2
+            display_name = args.display_name or name
+            existing = registry.list_mcp_servers()
+            if any(s["server_name"] == name for s in existing):
+                print(json.dumps({"ok": False, "error": f"MCP server {name!r} already exists"}, ensure_ascii=False))
+                return 1
+            created = registry.register_mcp_server(
+                server_name=name,
+                command=command,
+                args=args_list,
+                env=env,
+                tools=tools_list,
+                description=args.description,
+                display_name=display_name,
+                capabilities=capabilities,
+                source="cli",
+            )
+            result = {"ok": True, "server_name": name, "tools": tools_list, "entries_created": len(created)}
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print(f"Registered MCP server {name!r} with {len(created)} tool entries")
+            return 0
+
+        if args.mcp_server_cmd == "remove":
+            removed = registry.remove_mcp_server(args.name)
+            if removed > 0:
+                result = {"ok": True, "server_name": args.name, "entries_removed": removed}
+                if args.json:
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                else:
+                    print(f"Removed MCP server {args.name!r} ({removed} entries)")
+                return 0
+            else:
+                result = {"ok": False, "error": f"MCP server {args.name!r} not found"}
+                print(json.dumps(result, ensure_ascii=False, indent=2 if args.json else None))
+                return 1
 
     if args.cmd in {"verify-v45", "verify-release"}:
         from .verification import verify_v45_capabilities
@@ -602,6 +703,20 @@ def main() -> int:
             result = {"ok": True, "node_id": args.node_id, "run_id": run_id, "status": "failed", "reason": args.reason}
             print(json.dumps(result, ensure_ascii=False, indent=2 if args.json else None))
             return 0
+
+    # ------------------------------------------------------------------
+    # python-compat — Python 3.13+ feature detection
+    # ------------------------------------------------------------------
+    if args.cmd == "python-compat":
+        from .pycompat import check_all, summary_lines
+
+        report = check_all()
+        if args.json:
+            print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
+        else:
+            for line in summary_lines(report):
+                print(line)
+        return 0
 
     # ------------------------------------------------------------------
     # doctor + config — config_store driven diagnostics and mutation

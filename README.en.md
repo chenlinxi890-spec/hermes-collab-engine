@@ -64,6 +64,28 @@ hermes-collab run "Analyze current project structure" --cwd . --json
 - Web UI registration → auto-persisted, survives restarts
 - Leader auto-discovers available skills/tools and pre-assigns them during WBS phase
 
+### SkillDistributor (New This Week)
+- **Centralized Skill/Tool/MCP dispatch**: Planner auto-matches optimal skills & tools per node capability
+- **Search routing**: research/survey requests → analysis node → `search-verify` skill (multi-source search)
+- **Design routing**: UI/design requests → design → `frontend-optimization` skill (daisyUI + Tailwind)
+- **MCP tool injection**: capability-based MCP server matching, skill + MCP blocks injected into worker prompt
+- **Budget management**: auto-skip nodes when remaining budget < 30s, correctly reconcile parent node status
+- **Subprocess hang fix**: temp files instead of PIPE for stdout/stderr capture; prevents engine thread blocking when subprocess forks daemon children that inherit pipe FDs
+- **Run status fix**: removed "planning" stuck state; interrupted runs handled correctly
+
+### MCP Tool Integration (New This Week)
+| Server | Tools | Purpose |
+|---|---|---|
+| ferris-search | 7 tools | GitHub / Hacker News / Docs / Academic / StackOverflow aggregated search |
+| baidu-search | 1 tool | Baidu search engine |
+| open-websearch | 2 tools | DuckDuckGo + web content extraction |
+| daisyui-blueprint | 1 tool | daisyUI component AI generation (Blueprint MCP) |
+
+### Skill System Upgrade (New This Week)
+- **`search-verify`** skill: multi-source search → cross-verification → structured summary
+- **`frontend-optimization`** skill: daisyUI/Tailwind/unocss design spec, responsive layout, micro-interactions, a11y, theme system
+- **Dual-engine sync**: upstream (port 8765) + dragon-team (port 8766/8080) code consistency
+
 ### Agent Management
 - Built-in Agents (claude-code, hermes, codex, opencode)
 - Web UI registration of custom Agents with strict validation (name/command/capabilities)

@@ -34,21 +34,45 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
-def fetch_today(db_path: Path = ENGINE_DB) -> list[DayEvent]:
+def fetch_today(db_path: Path | None = None, day: str | None = None) -> list[DayEvent]:
     """Return every event that landed in the engine DB on the local date.
 
     Uses SQLite's ``date(..., 'localtime')`` modifier so the boundary
     matches the operator's wall clock, not UTC.
+
+    Args:
+        db_path: path to the engine SQLite DB. Defaults to the module's
+            ``ENGINE_DB``. NOTE: the default is ``None`` (not
+            ``ENGINE_DB``) — Python evaluates default-argument
+            expressions at function-definition time, so a default of
+            ``= ENGINE_DB`` would freeze the path at import time and
+            ignore later ``extractor.ENGINE_DB = ...`` patches (the
+            test pattern). (bug fix 2026-06-17.)
+        day: optional ``YYYY-MM-DD`` override. When given, the SQL
+            filter matches that local date instead of ``today``. This
+            is the back-fill path the CLI's ``--date`` flag relies on
+            — without it, ``--date 2026-06-16`` silently queried today
+            (2026-06-17) and returned 0 events. (bug, fixed 2026-06-17)
     """
+    db_path = db_path or ENGINE_DB
     events: list[DayEvent] = []
     conn = _connect(db_path)
     try:
+        # Day filter: either caller-supplied YYYY-MM-DD or 'now, localtime'.
+        # Both branches are validated to YYYY-MM-DD to avoid SQL injection.
+        if day:
+            import re as _re
+            if not _re.match(r"^\d{4}-\d{2}-\d{2}$", day):
+                raise ValueError(f"day must be YYYY-MM-DD, got {day!r}")
+            day_clause = f"date(created_at, 'localtime') = '{day}'"
+        else:
+            day_clause = "date(created_at, 'localtime') = date('now', 'localtime')"
         # 1. lessons — the primary source of truth for lessons-learned
         rows = conn.execute(
-            """
+            f"""
             SELECT id, scope, category, lesson, evidence_json, created_at
             FROM lessons
-            WHERE date(created_at, 'localtime') = date('now', 'localtime')
+            WHERE {day_clause}
             ORDER BY id
             """
         ).fetchall()
@@ -66,10 +90,10 @@ def fetch_today(db_path: Path = ENGINE_DB) -> list[DayEvent]:
 
         # 2. failed runs (and notable completed runs) — for context
         rows = conn.execute(
-            """
+            f"""
             SELECT id, title, status, request, created_at, updated_at, completed_at
             FROM runs
-            WHERE date(created_at, 'localtime') = date('now', 'localtime')
+            WHERE {day_clause}
             ORDER BY created_at
             """
         ).fetchall()
@@ -95,10 +119,10 @@ def fetch_today(db_path: Path = ENGINE_DB) -> list[DayEvent]:
         # daily cron.  We take the most recent 200 matching rows;
         # the rule-based summary only needs a handful anyway.
         rows = conn.execute(
-            """
+            f"""
             SELECT id, run_id, node_id, level, message, data_json, created_at
             FROM logs
-            WHERE date(created_at, 'localtime') = date('now', 'localtime')
+            WHERE {day_clause}
               AND level IN ('error', 'risk', 'warning')
             ORDER BY id DESC
             LIMIT 200
@@ -130,11 +154,16 @@ def _safe_json(s: str | None) -> Any:
         return {"_raw": str(s)[:200]}
 
 
-def summarise(events: Iterable[DayEvent]) -> dict[str, Any]:
+def summarise(events: Iterable[DayEvent], day: str | None = None) -> dict[str, Any]:
     """Rule-based leader summary.  No LLM; keeps the cron path zero-token.
 
     Returns a dict shaped so both memory_writer and skill_writer can
     consume it without re-parsing the raw event list.
+
+    Args:
+        events: list of DayEvent (from fetch_today).
+        day: optional YYYY-MM-DD. When set, used as the summary's
+            ``date`` field so back-fills label the right day.
     """
     by_cat: dict[str, list[DayEvent]] = {}
     for e in events:
@@ -174,7 +203,7 @@ def summarise(events: Iterable[DayEvent]) -> dict[str, Any]:
         leader_sentence = "Today: " + ", ".join(parts) + "."
 
     return {
-        "date": datetime.now().strftime("%Y-%m-%d"),
+        "date": day or datetime.now().strftime("%Y-%m-%d"),
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "counts": counts,
         "highlight": [e.__dict__ for e in highlight],

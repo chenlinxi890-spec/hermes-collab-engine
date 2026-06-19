@@ -9,6 +9,37 @@ from src.hermes_collab_engine.engine import CollabEngine
 from src.hermes_collab_engine.models import WBSNode
 
 
+class MockPopen:
+    """Mock for subprocess.Popen — configurable via class-level attributes.
+
+    Attributes:
+        _output_fn: callable(cmd, kwargs) → str for stdout (default: '{"result":"ok",...}')
+        _captured: dict updated by each instantiation
+    """
+    _output_fn = None
+    captured = {}
+
+    def __init__(self, cmd, **kwargs):
+        self.cmd = cmd
+        self.kwargs = kwargs
+        MockPopen.captured["cmd"] = cmd
+        MockPopen.captured["env"] = kwargs.get("env", {})
+        self.stdout = None
+        self.stderr = None
+        self.returncode = 0
+
+    def communicate(self, timeout=None):
+        if MockPopen._output_fn:
+            self.stdout = MockPopen._output_fn(self.cmd, self.kwargs)
+        else:
+            self.stdout = '{"result":"ok","session_id":"s1","is_error":false}'
+        self.stderr = ""
+        return (self.stdout, self.stderr)
+
+    def kill(self):
+        pass
+
+
 class WorkerPermissionCommandTest(unittest.TestCase):
     def test_worker_claude_command_allows_file_edits(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -24,21 +55,14 @@ class WorkerPermissionCommandTest(unittest.TestCase):
                 deliverable="Updated docs/example.md",
             )
 
-            captured = {}
+            MockPopen.captured = {}
+            MockPopen._output_fn = None
 
-            def fake_run(cmd, **kwargs):
-                captured["cmd"] = cmd
-                class Proc:
-                    returncode = 0
-                    stdout = '{"result":"ok","session_id":"s1","is_error":false}'
-                    stderr = ""
-                return Proc()
-
-            with patch("subprocess.run", side_effect=fake_run):
+            with patch("subprocess.Popen", MockPopen):
                 result = engine._run_worker("run_test", node, timeout=30)
 
             self.assertTrue(result.ok)
-            cmd = captured["cmd"]
+            cmd = MockPopen.captured["cmd"]
             self.assertIn("--permission-mode", cmd)
             self.assertIn("auto", cmd)
             self.assertIn("--allowedTools", cmd)
@@ -47,7 +71,7 @@ class WorkerPermissionCommandTest(unittest.TestCase):
             self.assertIn("Edit", allowed)
             self.assertIn("Write", allowed)
             self.assertIn("MultiEdit", allowed)
-            self.assertIn("Bash(", allowed)  # Some Bash tool profile is present
+            self.assertIn("Bash(", allowed)
 
     def test_worker_prompt_includes_reserved_write_targets(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -64,21 +88,14 @@ class WorkerPermissionCommandTest(unittest.TestCase):
                 write_targets=["src/hermes_collab_engine/engine.py"],
             )
 
-            captured = {}
+            MockPopen.captured = {}
+            MockPopen._output_fn = None
 
-            def fake_run(cmd, **kwargs):
-                captured["cmd"] = cmd
-                class Proc:
-                    returncode = 0
-                    stdout = '{"result":"ok","session_id":"s1","is_error":false}'
-                    stderr = ""
-                return Proc()
-
-            with patch("subprocess.run", side_effect=fake_run):
+            with patch("subprocess.Popen", MockPopen):
                 result = engine._run_worker("run_test", node, timeout=30)
 
             self.assertTrue(result.ok)
-            prompt = captured["cmd"][captured["cmd"].index("-p") + 1]
+            prompt = MockPopen.captured["cmd"][MockPopen.captured["cmd"].index("-p") + 1]
             self.assertIn("Write targets reserved for this worker: src/hermes_collab_engine/engine.py", prompt)
             self.assertIn("Only modify files under these repository-relative targets.", prompt)
 
@@ -154,23 +171,15 @@ class WorkerPermissionCommandTest(unittest.TestCase):
                 deliverable="Working implementation",
             )
 
-            captured = {}
+            MockPopen.captured = {}
+            MockPopen._output_fn = None
 
-            def fake_run(cmd, **kwargs):
-                captured["cmd"] = cmd
-                class Proc:
-                    returncode = 0
-                    stdout = '{"result":"ok","session_id":"s1","is_error":false}'
-                    stderr = ""
-                return Proc()
-
-            with patch("subprocess.run", side_effect=fake_run):
+            with patch("subprocess.Popen", MockPopen):
                 result = engine._run_worker("run_test", node, timeout=30)
 
             self.assertTrue(result.ok)
-            cmd = captured["cmd"]
+            cmd = MockPopen.captured["cmd"]
             allowed = cmd[cmd.index("--allowedTools") + 1]
-            # implementation includes git-write (commit, push) when task mentions it
             self.assertIn("Read", allowed)
             self.assertIn("Edit", allowed)
             self.assertIn("Bash(git diff*)", allowed)
@@ -193,23 +202,15 @@ class WorkerPermissionCommandTest(unittest.TestCase):
                 deliverable="Result",
             )
 
-            captured = {}
+            MockPopen.captured = {}
+            MockPopen._output_fn = None
 
-            def fake_run(cmd, **kwargs):
-                captured["cmd"] = cmd
-                class Proc:
-                    returncode = 0
-                    stdout = '{"result":"ok","session_id":"s1","is_error":false}'
-                    stderr = ""
-                return Proc()
-
-            with patch("subprocess.run", side_effect=fake_run):
+            with patch("subprocess.Popen", MockPopen):
                 result = engine._run_worker("run_test", node, timeout=30)
 
             self.assertTrue(result.ok)
-            cmd = captured["cmd"]
+            cmd = MockPopen.captured["cmd"]
             allowed = cmd[cmd.index("--allowedTools") + 1]
-            # No tool profiles matched → falls back to backend defaults
             self.assertIn("Read", allowed)
             self.assertIn("Edit", allowed)
 
@@ -227,26 +228,19 @@ class WorkerPermissionCommandTest(unittest.TestCase):
                 deliverable="Pushed branch",
             )
 
-            captured = {}
-
-            def fake_run(cmd, **kwargs):
-                captured["env"] = kwargs["env"]
-                class Proc:
-                    returncode = 0
-                    stdout = '{"result":"ok","session_id":"s1","is_error":false}'
-                    stderr = ""
-                return Proc()
+            MockPopen.captured = {}
+            MockPopen._output_fn = None
 
             env = {
                 "HERMES_COLLAB_WORKER_GIT_TOKEN": "secret-token",
                 "HERMES_COLLAB_WORKER_GIT_USERNAME": "git-user",
                 "HERMES_COLLAB_WORKER_GIT_ALLOWED_HOSTS": "github.com,git.example.com",
             }
-            with patch.dict("os.environ", env, clear=False), patch("subprocess.run", side_effect=fake_run):
+            with patch.dict("os.environ", env, clear=False), patch("subprocess.Popen", MockPopen):
                 result = engine._run_worker("run_test", node, timeout=30)
 
             self.assertTrue(result.ok)
-            worker_env = captured["env"]
+            worker_env = MockPopen.captured["env"]
             self.assertEqual(worker_env["GIT_TERMINAL_PROMPT"], "0")
             self.assertEqual(worker_env["HERMES_COLLAB_GIT_TOKEN"], "secret-token")
             self.assertEqual(worker_env["HERMES_COLLAB_GIT_USERNAME"], "git-user")
@@ -284,31 +278,37 @@ class WorkerPermissionCommandTest(unittest.TestCase):
             ]
             engine.planner.assess = lambda request: type("Score", (), {"routing": "wbs", "overall": 1, "to_dict": lambda self: {"routing": "wbs", "overall": 1}})()
             engine.planner.decompose = lambda request, **kw: type("PlanObj", (), {"nodes": nodes, "shared_brief": ""})()
+
             first_running = threading.Event()
             release_first = threading.Event()
             started: list[str] = []
             allowed_by_node: dict[str, str] = {}
             prompts_by_node: dict[str, str] = {}
             lock = threading.Lock()
+            call_count = 0
 
-            def fake_run(cmd, **kwargs):
-                prompt = cmd[cmd.index("-p") + 1]
-                node_id = "wbs-write-git" if "Write and git" in prompt else "wbs-overlap"
-                allowed = cmd[cmd.index("--allowedTools") + 1]
-                with lock:
-                    started.append(node_id)
-                    allowed_by_node[node_id] = allowed
-                    prompts_by_node[node_id] = prompt
-                if node_id == "wbs-write-git":
-                    first_running.set()
-                    release_first.wait(timeout=2)
-                class Proc:
-                    returncode = 0
-                    stdout = '{"result":"ok\\nHERMES-COLLAB-RESULT: {\\"status\\":\\"ok\\",\\"summary\\":\\"done\\",\\"files_modified\\":[\\"src/app.py\\"],\\"verification\\":[\\"simulated worker command returned 0\\"],\\"notes\\":[]}","session_id":"s1","is_error":false}'
-                    stderr = ""
-                return Proc()
+            class ThreadingMockPopen(MockPopen):
+                def __init__(self, cmd, **kwargs):
+                    nonlocal call_count
+                    call_count += 1
+                    super().__init__(cmd, **kwargs)
+                    prompt = cmd[cmd.index("-p") + 1]
+                    node_id = "wbs-write-git" if "Write and git" in prompt else "wbs-overlap"
+                    allowed = cmd[cmd.index("--allowedTools") + 1]
+                    with lock:
+                        started.append(node_id)
+                        allowed_by_node[node_id] = allowed
+                        prompts_by_node[node_id] = prompt
+                    if node_id == "wbs-write-git":
+                        first_running.set()
+                        release_first.wait(timeout=2)
 
-            with patch("subprocess.run", side_effect=fake_run):
+                def communicate(self, timeout=None):
+                    self.stdout = '{"result":"ok\\nHERMES-COLLAB-RESULT:{\\\"status\\\":\\\"ok\\\",\\\"summary\\\":\\\"done\\\",\\\"files_modified\\":[\\\"src/app.py\\\"],\\\"verification\\":[\\\"simulated worker command returned 0\\\"],\\\"notes\\":[]}","session_id":"s1","is_error":false}'
+                    self.stderr = ""
+                    return (self.stdout, self.stderr)
+
+            with patch("subprocess.Popen", ThreadingMockPopen):
                 runner = threading.Thread(target=lambda: engine.run("minimal write git", concurrency=2, aggregate=False))
                 runner.start()
                 self.assertTrue(first_running.wait(timeout=2))

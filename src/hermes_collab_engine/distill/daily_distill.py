@@ -43,13 +43,12 @@ def run(*, date: str | None = None, dry_run: bool = False) -> dict:
 
     Returns a status dict suitable for logging or the cron caller.
     """
-    # If --date given we still use the live DB (the day filter is
-    # applied by SQL's 'now, localtime' but we expose an override
-    # path for back-fills in the future).
-    events = fetch_today()
-    summary = summarise(events)
-    if date:
-        summary["date"] = date  # honour CLI override for labelling only
+    # If --date given we use it as the SQL day filter; otherwise today.
+    # (bug fix 2026-06-17: previously --date only changed the label
+    #  but fetch_today still queried 'now, localtime', so back-fills
+    #  silently returned 0 events for any historical date.)
+    events = fetch_today(day=date)
+    summary = summarise(events, day=date)
 
     title = f"Daily distill {summary['date']}"
     body_lines = [

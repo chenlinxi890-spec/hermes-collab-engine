@@ -5,7 +5,7 @@ based on WBS node capability and task wording.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 
 @dataclass
@@ -18,6 +18,7 @@ class SkillEntry:
     applicable_node_types: list[str]
     priority: int
     source: str
+    required_tools: list[str] = field(default_factory=list)  # tool profiles needed by this skill (used by SkillDistributor)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -92,6 +93,7 @@ _TASK_KEYWORDS: dict[str, tuple[str, ...]] = {
     "search-verify": ("find", "search", "scope", "evidence", "read-only", "locate"),
     "debug-root-cause": ("bug", "debug", "failure", "traceback", "error", "fix"),
     "risk-checkpoint": ("risk", "checkpoint", "security", "permission", "destructive"),
+    "frontend-optimization": ("ui", "frontend", "design", "interface", "css", "tailwind", "daisyui", "component", "responsive", "a11y", "accessibility", "美观", "界面", "布局", "样式"),
 }
 
 
@@ -126,15 +128,26 @@ _BUILTIN_SKILLS = [
     ),
     SkillEntry(
         name="search-verify",
-        display_name="Search & Evidence",
+        display_name="Multi-Source Search & Verification",
         category="research",
-        description="Locate existing patterns before changing behavior.",
+        description="Multi-source search verification — search, fact-check, and cross-validate across multiple engines and platforms.",
         content=(
-            "- Identify the smallest relevant entrypoints before editing.\n"
-            "- Reuse existing abstractions instead of creating parallel systems.\n"
-            "- Preserve useful file and symbol evidence for downstream workers."
+            "# Multi-Source Search & Verification\n\n"
+            "When searching for information and verifying results, use multiple sources in parallel:\n\n"
+            "## Available MCP Search Tools\n"
+            "- `ferris-search`: Multi-engine search (`web_search`) with fetch tools for CSDN, Zhihu, Juejin, Linux.do, GitHub\n"
+            "- `baidu-search`: Baidu search (`baidu_search`)\n"
+            "- `open-websearch`: General web search\n\n"
+            "## Search Strategy\n"
+            "1. Call MCP tools directly — do not pre-check availability, just call and handle errors\n"
+            "2. Parallel multi-source searches on the same query\n"
+            "3. Fetch full content from important links using platform-specific fetch tools\n"
+            "4. Cross-validate: multiple sources agreeing = high confidence\n"
+            "5. Fallback: curl Bing/Baidu if all MCP tools fail\n\n"
+            "## Output Format\n"
+            "Produce a verification report: query, sources used, core findings with confidence levels, detailed source list."
         ),
-        applicable_node_types=["analysis", "research", "planning"],
+        applicable_node_types=["analysis", "research", "planning", "scope", "evidence"],
         priority=1,
         source="hermes",
     ),
@@ -166,8 +179,83 @@ _BUILTIN_SKILLS = [
         priority=3,
         source="hermes",
     ),
+    SkillEntry(
+        name="browser-automation",
+        display_name="Browser Automation",
+        category="automation",
+        description="Control a headless Chrome browser via GuidedRunner.",
+        content=(
+            "You have a headless Chrome browser available. "
+            "Use the GuidedRunner to execute browser automation tasks: "
+            "navigate to pages, click elements, fill forms, take screenshots, "
+            "and verify rendered content. "
+            "Common actions: goto, click, fill, wait, expect_text, screenshot. "
+            "For complex interactions (drag-and-drop, file uploads, iframes), "
+            "use the custom 'code' field with raw JavaScript."
+        ),
+        applicable_node_types=["implementation", "verification", "debugging"],
+        priority=1,
+        source="hermes",
+    ),
+    SkillEntry(
+        name="frontend-optimization",
+        display_name="Frontend Optimization & UI Design",
+        category="design",
+        description="Build beautiful, accessible, performant frontends with Tailwind CSS, daisyUI, and modern UX patterns.",
+        content=(
+            "# Frontend Optimization & UI Design\n\n"
+            "Build interfaces that are beautiful, responsive, accessible, and performant.\n\n"
+            "## Tailwind CSS & daisyUI\n"
+            "- Use daisyUI components when available: buttons, cards, modals, navbar, drawer, tabs, forms\n"
+            "- daisyUI theme classes: `data-theme=\"light\"`, `data-theme=\"dark\"`, `data-theme=\"cupcake\"` etc.\n"
+            "- Tailwind utility-first: prefer `flex`, `grid`, `gap-*`, `p-*`, `m-*` over custom CSS\n"
+            "- Responsive breakpoints: `sm:`, `md:`, `lg:`, `xl:`, `2xl:` in that order\n"
+            "- Dark mode: use `dark:` prefix or `class` strategy with daisyUI\n"
+            "- Avoid hard-coded colors; use design tokens: `primary`, `secondary`, `accent`, `base-*`\n"
+            "- Component variation: daisyUI uses `btn-primary`, `btn-outline`, `btn-ghost`, `btn-sm` modifiers\n\n"
+            "## Responsive Design\n"
+            "- Mobile-first: start with mobile layout, add `sm:`/`md:` breakpoints to enhance\n"
+            "- Use `container` with `mx-auto` for centered layouts\n"
+            "- Test all states: 320px, 768px, 1024px, 1440px\n"
+            "- Touch targets: minimum 44x44px for interactive elements\n"
+            "- Text: min 16px body font to prevent iOS zoom on input focus\n\n"
+            "## Interaction & UX\n"
+            "- Feedback states for every interactive element: hover, active, focus, disabled, loading\n"
+            "- Use daisyUI `loading` class or animated spinners for loading states\n"
+            "- Transitions: `transition-all duration-200` for smooth state changes\n"
+            "- Empty states: show helpful placeholder when list/data is empty\n"
+            "- Error states: show inline validation, not just toast alerts\n"
+            "- Skeleton loading: use `skeleton` component for content placeholders\n"
+            "- Micro-interactions: subtle hover scale, button press, card elevation change\n\n"
+            "## Accessibility (A11Y)\n"
+            "- Semantic HTML: `<nav>`, `<main>`, `<section>`, `<article>`, `<aside>`, `<footer>`\n"
+            "- ARIA labels: `aria-label`, `aria-labelledby`, `aria-describedby` on all actionable elements\n"
+            "- Keyboard navigation: all interactive elements focusable via Tab, activate with Enter/Space\n"
+            "- Focus indicators: never remove `outline` without providing visible focus ring\n"
+            "- Color contrast: text on background ≥ 4.5:1 ratio (WCAG AA), large text ≥ 3:1\n"
+            "- Form labels: every `<input>` must have an associated `<label>` or `aria-label`\n"
+            "- Screen readers: `sr-only` class for visually-hidden but accessible text\n"
+            "- Reduced motion: respect `prefers-reduced-motion` for animations\n\n"
+            "## Design System Consistency\n"
+            "- Establish a spacing scale: 4/8/12/16/24/32/48/64px (Tailwind `p-1` to `p-16`)\n"
+            "- Typography: max 2-3 font sizes per page, clear hierarchy (heading/subtitle/body/caption)\n"
+            "- Color: use 1 primary + 1 secondary + semantic colors (success/warning/error/info)\n"
+            "- Border radius: consistent `rounded-box`/`rounded-btn` from daisyUI\n"
+            "- Shadows: daisyUI `shadow-sm`, `shadow-md`, `shadow-lg`, `shadow-xl`\n"
+            "- Icons: use Lucide or Heroicons — consistent style and sizing throughout\n\n"
+            "## Performance\n"
+            "- Lazy load below-fold images and components\n"
+            "- Code split at route level — each page only loads its own JS\n"
+            "- Optimize images: WebP/AVIF format, responsive srcset\n"
+            "- Minimize DOM size — virtualize long lists (>100 items)\n"
+            "- CSS: use Tailwind JIT — only ship what you use\n"
+            "- Monitor: Core Web Vitals (LCP < 2.5s, FID < 100ms, CLS < 0.1)"
+        ),
+        applicable_node_types=["implementation", "verification", "design", "frontend", "ui"],
+        priority=2,
+        source="hermes",
+    ),
 ]
-
 
 _DEFAULT_REGISTRY = SkillRegistry()
 

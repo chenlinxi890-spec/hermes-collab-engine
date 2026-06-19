@@ -327,10 +327,10 @@ class AgentBackendProviderIntegrationTests(unittest.TestCase):
         backend = get_backend("opencode")
         # Pass provider explicitly
         cmd = backend.build_command(prompt="test", model="deepseek-chat", provider=p)
-        # opencode does not support --model flag (supports_model_flag=False)
-        # so model_prefix should NOT appear
-        self.assertNotIn("--model", cmd)
-        self.assertNotIn("opencode-go/deepseek-chat", cmd)
+        # opencode now supports --model flag (supports_model_flag=True)
+        # so model_prefix should appear with the model
+        self.assertIn("--model", cmd)
+        self.assertIn("opencode-go/deepseek-chat", cmd)
 
     def test_build_command_claude_with_provider_prefix(self):
         from src.hermes_collab_engine.agents import get_backend

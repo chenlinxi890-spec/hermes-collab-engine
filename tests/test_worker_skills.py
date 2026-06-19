@@ -7,6 +7,27 @@ from src.hermes_collab_engine.engine import CollabEngine
 from src.hermes_collab_engine.models import WBSNode
 
 
+class MockPopen:
+    """Mock for subprocess.Popen — captures cmd, returns canned output."""
+    captured = {}
+
+    def __init__(self, cmd, **kwargs):
+        self.cmd = cmd
+        self.kwargs = kwargs
+        MockPopen.captured["cmd"] = cmd
+        self.stdout = None
+        self.stderr = None
+        self.returncode = 0
+
+    def communicate(self, timeout=None):
+        self.stdout = '{"result":"done\\nHERMES-COLLAB-RESULT:{\\\"status\\\":\\\"ok\\\",\\\"summary\\\":\\\"done\\\",\\\"files_modified\\":[],\\\"verification\\":[]}","session_id":"s1","is_error":false}'
+        self.stderr = ""
+        return (self.stdout, self.stderr)
+
+    def kill(self):
+        pass
+
+
 class WorkerSkillInjectionTest(unittest.TestCase):
     def test_worker_prompt_includes_selected_skills(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -22,35 +43,20 @@ class WorkerSkillInjectionTest(unittest.TestCase):
                 deliverable="Working implementation",
             )
 
-            captured = {}
+            import json as _json
+            node.skills_json = _json.dumps(["implementation-focus", "test-verify"])
 
-            def fake_run(cmd, **kwargs):
-                captured["cmd"] = cmd
+            MockPopen.captured = {}
 
-                class Proc:
-                    returncode = 0
-                    stdout = '{"result":"done\\nHERMES-COLLAB-RESULT:{\\\"status\\\":\\\"ok\\\",\\\"summary\\\":\\\"done\\\",\\\"files_modified\\\":[],\\\"verification\\\":[]}","session_id":"s1","is_error":false}'
-                    stderr = ""
-
-                return Proc()
-
-            with patch("subprocess.run", side_effect=fake_run):
-                # Simulate Leader pre-allocating skills to the node
-                import json as _json
-                node.skills_json = _json.dumps(["implementation-focus", "test-verify"])
+            with patch("subprocess.Popen", MockPopen):
                 result = engine._run_worker("run_test", node, timeout=30)
 
             self.assertTrue(result.ok)
-            prompt = captured["cmd"][captured["cmd"].index("-p") + 1]
+            prompt = MockPopen.captured["cmd"][MockPopen.captured["cmd"].index("-p") + 1]
             self.assertIn("Relevant skills injected by Hermes", prompt)
             self.assertIn("Focused Implementation", prompt)
             self.assertIn("Test & Verification", prompt)
-            # Skills are now Leader-allocated and stored in node.skills_json
-            # The node object passed to _run_worker should have skills_json populated
             self.assertIsNotNone(node.skills_json)
-            import json as _json
-            skills = _json.loads(node.skills_json) if node.skills_json else []
-            self.assertTrue(len(skills) > 0, "Skills should be pre-allocated on the node")
 
 
 if __name__ == "__main__":

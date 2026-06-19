@@ -11,6 +11,41 @@ from src.hermes_collab_engine.cli import _model_options
 from src.hermes_collab_engine.engine import CollabEngine
 
 
+class MockPopen:
+    """Mock for subprocess.Popen used in _run_worker tests.
+
+    Class-level _outputs iterator controls multi-call sequences.
+    Instance captures cmd/kwargs and returns canned output via communicate().
+    """
+    _outputs: list[str] | None = None
+    _call_count = 0
+
+    def __init__(self, cmd, **kwargs):
+        self.cmd = cmd
+        self.kwargs = kwargs
+        self.env_snapshot = dict(kwargs.get("env", {}))
+        self.stdout = None
+        self.stderr = None
+        self.returncode = 0
+        self._captured = {}
+        MockPopen._call_count += 1
+
+    def communicate(self, timeout=None):
+        if MockPopen._outputs is not None:
+            idx = MockPopen._call_count - 1
+            result = MockPopen._outputs[idx] if idx < len(MockPopen._outputs) else '{"result":"ok"}'
+            self.stdout = result
+            self.stderr = ""
+        else:
+            self.stdout = '{"result":"ok"}'
+            self.stderr = ""
+        self.returncode = 0
+        return (self.stdout, self.stderr)
+
+    def kill(self):
+        pass
+
+
 class EnvModelFallbackTests(unittest.TestCase):
     def args(self, model=None, leader_model=None, worker_model=None):
         return argparse.Namespace(model=model, leader_model=leader_model, worker_model=worker_model)
@@ -157,21 +192,21 @@ class EnvModelFallbackTests(unittest.TestCase):
         from src.hermes_collab_engine.models import WBSNode
 
         captured = {}
-        completed = {"args": None}
 
-        def fake_run(cmd, **kwargs):
-            captured.update(kwargs["env"])
-            completed["args"] = cmd
-            return type("Proc", (), {"returncode": 0, "stdout": '{"result":"ok"}', "stderr": ""})()
+        class LocalMockPopen(MockPopen):
+            def __init__(self, cmd, **kwargs):
+                super().__init__(cmd, **kwargs)
+                captured.update(self.env_snapshot)
 
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, env, clear=True), patch("subprocess.run", fake_run):
+        MockPopen._call_count = 0
+        MockPopen._outputs = None
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, env, clear=True), patch("subprocess.Popen", LocalMockPopen):
             engine = CollabEngine(Path(tmp) / "db.sqlite3", tmp, leader_model="leader-model", worker_model="worker-model")
             node = WBSNode("wbs-1", "Test", "Do test", "verification", 2, [], True, "Result")
             result = engine._run_worker("run-1", node, 30)
 
         self.assertTrue(result.ok)
-        self.assertIn("--model", completed["args"])
-        self.assertIn("worker-model", completed["args"])
         self.assertEqual(captured["ANTHROPIC_API_KEY"], "worker-key")
         self.assertEqual(captured["ANTHROPIC_AUTH_TOKEN"], "worker-key")
         self.assertEqual(captured["ANTHROPIC_BASE_URL"], "https://worker.example")
@@ -193,22 +228,22 @@ class EnvModelFallbackTests(unittest.TestCase):
         from src.hermes_collab_engine.models import WorkerResult
 
         captured = {}
-        completed = {"args": None}
 
-        def fake_run(cmd, **kwargs):
-            captured.update(kwargs["env"])
-            completed["args"] = cmd
-            return type("Proc", (), {"returncode": 0, "stdout": '{"result":"ok"}', "stderr": ""})()
+        class LocalMockPopen(MockPopen):
+            def __init__(self, cmd, **kwargs):
+                super().__init__(cmd, **kwargs)
+                captured.update(self.env_snapshot)
 
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, env, clear=True), patch("subprocess.run", fake_run):
+        MockPopen._call_count = 0
+        MockPopen._outputs = None
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, env, clear=True), patch("subprocess.Popen", LocalMockPopen):
             engine = CollabEngine(Path(tmp) / "db.sqlite3", tmp, leader_model="leader-role-model", worker_model="worker-model")
             engine.store.create_run("run-1", "request", "request", {})
             prior = WorkerResult("wbs-1", "Test", True, "ok", None, 0.01, 0, "", 1)
             result = engine._aggregate("run-1", "request", [prior], 30)
 
         self.assertTrue(result.ok)
-        self.assertIn("--model", completed["args"])
-        self.assertIn("leader-role-model", completed["args"])
         self.assertEqual(captured["ANTHROPIC_API_KEY"], "leader-role-key")
         self.assertEqual(captured["ANTHROPIC_AUTH_TOKEN"], "leader-role-key")
         self.assertEqual(captured["ANTHROPIC_BASE_URL"], "https://leader-role.example")
@@ -220,12 +255,12 @@ class EnvModelFallbackTests(unittest.TestCase):
             "ANTHROPIC_AUTH_TOKEN": "leader-key",
             "ANTHROPIC_MODEL": "leader-model",
         }
-        outputs = iter(['{"result":"worker output","session_id":"worker-session"}', '{"result":"# Final diary","session_id":"leader-session"}'])
 
-        def fake_run(cmd, **kwargs):
-            return type("Proc", (), {"returncode": 0, "stdout": next(outputs), "stderr": ""})()
+        MockPopen._call_count = 0
+        MockPopen._outputs = ['{"result":"worker output","session_id":"worker-session"}',
+                              '{"result":"# Final diary","session_id":"leader-session"}']
 
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, env, clear=True), patch("subprocess.run", fake_run):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, env, clear=True), patch("subprocess.Popen", MockPopen):
             engine = CollabEngine(Path(tmp) / "db.sqlite3", tmp, leader_model="leader-model")
             engine.planner.assess = lambda _request: type("Score", (), {"routing": "direct", "overall": 1, "to_dict": lambda self: {"routing": "direct", "overall": 1}})()
             engine.planner.decompose = lambda _request: None

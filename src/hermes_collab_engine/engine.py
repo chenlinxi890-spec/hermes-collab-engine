@@ -4,6 +4,7 @@ import concurrent.futures
 import hashlib
 import json
 import fnmatch
+import logging
 import os
 import re
 import subprocess
@@ -20,6 +21,7 @@ from .skills import SkillRegistry, get_default_registry
 from .store import CollabStore
 from .tools import ToolRegistry, get_default_tool_registry
 from .registry import get_unified_registry, SkillEntry as USkillEntry, ToolEntry as UToolEntry, MCPEntry as UMCPEntry
+from .skill_distributor import SkillDistributor
 
 
 class CollabEngine:
@@ -29,33 +31,10 @@ class CollabEngine:
     _UPSTREAM_ANCESTOR_CAP = 100
     _UPSTREAM_TOTAL_CAP = 3000
     _RESULT_MARKER = "HERMES-COLLAB-RESULT:"
-    # 2026-06-16 anti-avalanche: cap how deep shard nesting can go. The previous
-    # 4-run storm in session 20260615_234608_dbad00 produced
-    # `wbs-2-evidence-2-evidence-2` style 2-level-deep shards (e.g. 6 nested
-    # shards on top of one root). With no depth cap, a 3rd-level failure would
-    # create `wbs-2-evidence-2-evidence-2-scope-1` etc — an unbounded explosion
-    # that wastes worker slots and obscures the real failure mode.
-    #
-    # Semantics:
-    #   depth=0 (root, no parent_id)         → CAN be split (its shards = depth 1)
-    #   depth=1 (first-generation shard)     → CANNOT be split further
-    #   depth=2+ (shard of shard)            → CANNOT exist (refused at creation)
-    #
-    # So with _MAX_SHARD_DEPTH=1, only ONE level of splitting is permitted:
-    # root → {scope, evidence, impl} shards, and those shards MUST run as-is.
-    # This matches the intent of the original feature ("split once if a node is
-    # over budget") and stops recursive cascading splits like the 6-nested-shard
-    # explosion seen in session 20260615_234608_dbad00.
-    #
-    # Tradeoff: a first-level shard that times out will simply fail rather than
-    # getting a chance to split. Operators who want deeper splits can set
-    # HERMES_COLLAB_MAX_SHARD_DEPTH=N (or subclass and override the constant).
+    # Anti-avalanche: cap how deep shard nesting can go.
     _MAX_SHARD_DEPTH = max(
         1, int(os.environ.get("HERMES_COLLAB_MAX_SHARD_DEPTH", "1"))
     )
-    # Soft-warning depth: when a shard already sits at this depth, we log a
-    # warning if anyone tries to split it, instead of silently failing. This
-    # makes anti-avalanche behavior visible in logs.
     _SHARD_DEPTH_WARN_LOG = True
 
     def __init__(
@@ -76,33 +55,127 @@ class CollabEngine:
         self.leader_model = leader_model or model or os.environ.get("HERMES_COLLAB_LEADER_MODEL") or env_model
         self.worker_model = worker_model or model or os.environ.get("HERMES_COLLAB_WORKER_MODEL") or env_model
         self.agent_backend: AgentBackend = get_backend(agent)
-        self.provider = provider  # Optional ProviderProfile instance
+        self.provider = provider
         self.skill_registry = skill_registry or get_default_registry()
         self.tool_registry = tool_registry or get_default_tool_registry()
+        self._skill_distributor = SkillDistributor(
+            skill_registry=self.skill_registry,
+            tool_registry=self.tool_registry,
+        )
         self.store = CollabStore(db_path)
+        # Load agent profiles for leader/worker model overrides
         # Initialize unified registry with store for persistence
         get_unified_registry(store=self.store)
-        self.planner = Planner(self.cwd, model=self.leader_model, store=self.store)
+        self.planner = Planner(self.cwd, model=self.leader_model, store=self.store, skill_registry=self.skill_registry, tool_registry=self.tool_registry)
         self._node_results: dict[str, str] = {}
         self._node_results_struct: dict[str, dict[str, Any] | None] = {}
         self._node_results_lock = threading.Lock()
         self._current_plan: Plan | None = None
         self._risk_assessments: list[dict[str, Any]] = []
-        self._checkpoint_paused_nodes: set[str] = set()  # per-run; reset at start of every run() call
+        self._checkpoint_paused_nodes: set[str] = set()
         self._paused_runs: set[str] = set()
         self._file_allowlist: set[str] = set()
         self._active_write_targets: dict[str, set[str]] = {}
         self._write_targets_lock = threading.Lock()
         self._active_fingerprints: dict[str, str] = {}
         self._fingerprint_lock = threading.Lock()
+        # Worker process tracking for resource-pressure killing
+        self._worker_procs: dict[str, subprocess.Popen] = {}
+        self._worker_procs_lock = threading.Lock()
+        self._resource_timeout_nodes: set[str] = set()
         # Global worker semaphore: caps opencode worker processes across ALL runs
-        # to prevent 4-run storm from spawning 50+ lsp-daemon children on 4GB boxes.
-        # Allows override via env HERMES_COLLAB_GLOBAL_MAX_CONCURRENT.
         self._global_max_concurrent = max(
             1, int(os.environ.get("HERMES_COLLAB_GLOBAL_MAX_CONCURRENT", str(global_max_concurrent)))
         )
         self._global_worker_sem = threading.Semaphore(self._global_max_concurrent)
+        profiles = self._load_agent_profiles()
+        self._leader_profile: dict[str, str] | None = profiles["leader"]
+        self._worker_profile: dict[str, str] | None = profiles["worker"]
         self._restore_all_run_states()
+
+    def _load_agent_profiles(self) -> dict[str, dict[str, str] | None]:
+        """Load leader and worker profiles from data/agents.db.
+
+        Returns:
+            Dict with 'leader' and 'worker' keys. Each value is a dict with
+            base_url, api_key, model fields, or None if not found.
+        """
+        db_path = self.cwd / "data" / "agents.db"
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(str(db_path))
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+
+            leader: dict[str, str] | None = None
+            cur.execute(
+                "SELECT base_url, api_key, model FROM agents_profiles WHERE name=? AND is_active=1",
+                ("leader",),
+            )
+            row = cur.fetchone()
+            if row:
+                leader = {
+                    "base_url": row["base_url"],
+                    "api_key": row["api_key"],
+                    "model": row["model"],
+                }
+
+            worker: dict[str, str] | None = None
+            cur.execute(
+                "SELECT base_url, api_key, model FROM agents_profiles WHERE name!=? AND is_active=1 LIMIT 1",
+                ("leader",),
+            )
+            row = cur.fetchone()
+            if row:
+                worker = {
+                    "base_url": row["base_url"],
+                    "api_key": row["api_key"],
+                    "model": row["model"],
+                }
+
+            conn.close()
+            return {"leader": leader, "worker": worker}
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Failed to load agent profiles from %s", db_path, exc_info=True
+            )
+            return {"leader": None, "worker": None}
+
+    def _summarize_package_plan(self, package: str) -> str:
+        """Render a one-line plan summary for a package.
+
+        Reads the graph definition from packages.sqlite3 via
+        ``backend.graph_interpreter`` and returns ``summarize_text(graph)``
+        — or "" if the package has no graph yet or the interpreter
+        is unavailable.
+        """
+        try:
+            import sys
+            # Ensure backend/ is importable regardless of how the
+            # engine was launched (cron, CLI, in-process test).
+            backend_src = str(self.cwd / "src")
+            if backend_src not in sys.path:
+                sys.path.insert(0, backend_src)
+            from backend.graph_interpreter import summarize_text
+            from backend.skill_graph import SkillGraph
+            from backend.scenario_packages import get_package
+            db_path = self.cwd / "data" / "packages.sqlite3"
+            if not db_path.exists():
+                return ""
+            pkg = get_package(package, db_path=str(db_path))
+            if not pkg:
+                return ""
+            graph_def = pkg.get("graph_definition") or {}
+            if not graph_def:
+                return ""
+            graph = SkillGraph.from_dict(graph_def)
+            return summarize_text(graph)
+        except Exception as exc:
+            logging.getLogger(__name__).debug(
+                "_summarize_package_plan failed for %s: %s", package, exc
+            )
+            return ""
 
     def _persist_run_state(self, run_id: str) -> None:
         self.store.save_run_state(run_id, run_id in self._paused_runs, self._checkpoint_paused_nodes)
@@ -137,17 +210,37 @@ class CollabEngine:
             "checkpoint_paused_nodes": sorted(self._checkpoint_paused_nodes),
         }
 
-    def run(self, request: str, *, title: str | None = None, concurrency: int = 4, timeout: int = 900, max_retries: int = 2, split_count: int = 4, aggregate: bool = True) -> dict:
+    def run(self, request: str, *, title: str | None = None, concurrency: int = 4, timeout: int = 86400, max_retries: int = 2, split_count: int = 4, aggregate: bool = True, package: str | None = None, package_skills: list[str] | None = None) -> dict:
         run_id = "run_" + uuid.uuid4().hex[:12]
         score = self.planner.assess(request)
         self.store.create_run(run_id, title or request[:80], request, score.to_dict(), agent=self.agent_backend.name)
-        self.store.update_run(run_id, "planning")
         self.store.log(run_id, "info", "complexity assessed", score.to_dict())
+        # Persist package + the Skill collection it triggered so the dashboard
+        # and downstream workers can see which scenario Leader picked.
+        # If a package is set, also try to read its graph definition and
+        # render a one-line plan summary via graph_interpreter.summarize_text
+        # so the chat bubble can show "📋 Run 4 steps (3 skill, ...)".
+        package_plan: str = ""
+        if package:
+            package_plan = self._summarize_package_plan(package)
+        if package or package_skills:
+            self.store.set_run_meta(run_id, {
+                "package": package,
+                "package_skills": list(package_skills or []),
+                "package_plan": package_plan,
+            })
 
         if score.routing == "direct":
-            plan = Plan(nodes=[WBSNode("wbs-1", "Direct execution", request, "general", score.overall, [], True, "Direct answer")])
+            # Check if task is design/frontend related
+            _design_keywords = ["design", "ui", "ux", "interface", "layout", "frontend",
+                                "component", "tailwind", "daisyui", "button", "card", "modal",
+                                "navbar", "login", "form", "landing", "dashboard",
+                                "设计", "界面", "布局", "美观", "样式", "漂亮", "好看",
+                                "登录", "注册", "导航", "卡片", "弹窗", "页面"]
+            _cap = "design" if any(k in request.lower() for k in _design_keywords) else "general"
+            plan = Plan(nodes=[WBSNode("wbs-1", "Direct execution", request, _cap, score.overall, [], True, "Direct answer")])
         else:
-            plan = self.planner.decompose(request, capabilities=self.agent_backend.capabilities)
+            plan = self.planner.decompose(request, capabilities=self.agent_backend.capabilities, agent_backend=self.agent_backend)
         if isinstance(plan, list):
             plan = Plan(nodes=plan)
         nodes = plan.nodes
@@ -161,24 +254,54 @@ class CollabEngine:
             self._node_results = {}
             self._node_results_struct = {}
         self._risk_assessments = []
+        # Mode B fix: each node insertion is its own try/except
+        inserted_node_ids: list[str] = []
         for node in nodes:
-            node_data = node.to_dict()
-            node_data["shared_brief"] = plan.shared_brief
-            self.store.insert_wbs_node(run_id, node_data)
+            try:
+                node_data = node.to_dict()
+                node_data["shared_brief"] = plan.shared_brief
+                self.store.insert_wbs_node(run_id, node_data)
+                inserted_node_ids.append(node.id)
+            except Exception as exc:
+                self.store.log(
+                    run_id, "error",
+                    "wbs node insert failed; skipping this node",
+                    {"node": getattr(node, "id", "?"), "error": f"{type(exc).__name__}: {exc}"},
+                )
+                self.store.add_lesson(
+                    "wbs-persistence",
+                    f"Failed to insert WBS node {getattr(node, 'id', '?')} into SQLite; engine continued with remaining nodes. ({type(exc).__name__}: {exc})",
+                    {"run_id": run_id, "node": getattr(node, "id", "?")},
+                )
+        # If we intended N nodes but only wrote fewer, fail loud now
+        if len(inserted_node_ids) < len(nodes):
+            missing = [n.id for n in nodes if n.id not in inserted_node_ids]
+            self.store.log(
+                run_id, "error",
+                "wbs persistence incomplete; aborting run before dispatch",
+                {"expected": len(nodes), "inserted": len(inserted_node_ids), "missing": missing},
+            )
+            self.store.update_run(run_id, "failed")
+            self.store.log(run_id, "error", "run aborted; wbs persistence incomplete", {"missing": missing})
+            return {
+                "run_id": run_id,
+                "ok": False,
+                "complexity": score.to_dict(),
+                "results": [],
+                "aggregate": None,
+                "lessons_learned": [],
+                "abort_reason": f"wbs_persistence_incomplete: missing {missing}",
+            }
         self._preallocate_skills_tools(run_id, nodes)
         self._restore_run_state(run_id)
-        # CRITICAL: After restoring this run's own checkpoint_paused state,
-        # override with this run's persisted state (load_run_state for this run_id).
-        # Without this, new runs would inherit checkpoint pauses from old runs
-        # via _restore_all_run_states (which merged all historical paused nodes
-        # into a process-global set), causing dispatch to deadlock waiting for
-        # dep nodes that aren't paused in this run.
+        # Override with this run's own checkpoint_paused state
         run_state = self.store.load_run_state(run_id)
         if isinstance(run_state, dict):
             self._checkpoint_paused_nodes = set(run_state.get("checkpoint_paused_nodes") or [])
         else:
             self._checkpoint_paused_nodes = set()
         self.store.update_run(run_id, "running")
+        started_at = time.time()  # total run budget clock
 
         try:
             results: list[WorkerResult] = []
@@ -236,12 +359,10 @@ class CollabEngine:
                         write_targets = self._claim_write_targets(node)
                         if write_targets:
                             self.store.log(run_id, "info", "worker write targets claimed", {"node": node.id, "write_targets": sorted(write_targets)}, node.id)
-                        if self._should_split_proactively(node, timeout, max_retries, split_count):
+                        if self._should_split_proactively(node, timeout, max_retries, split_count, started_at):
                             self._release_fingerprint(node.id)
+                            self._release_write_targets(node.id)
                             if self._shard_too_deep(node, run_id=run_id):
-                                # Anti-avalanche: skip splitting this node.
-                                # It will be picked up by the normal worker
-                                # dispatch path below and run as-is.
                                 self.store.log(
                                     run_id,
                                     "warning",
@@ -249,7 +370,7 @@ class CollabEngine:
                                     {
                                         "node": node.id,
                                         "estimated_duration": node.estimated_duration,
-                                        "effective_timeout": self._effective_timeout(node, timeout),
+                                        "effective_timeout": self._effective_timeout(node, timeout, started_at),
                                         "timeout": timeout,
                                         "max_shard_depth": self._MAX_SHARD_DEPTH,
                                     },
@@ -268,7 +389,7 @@ class CollabEngine:
                                     {
                                         "node": node.id,
                                         "estimated_duration": node.estimated_duration,
-                                        "effective_timeout": self._effective_timeout(node, timeout),
+                                        "effective_timeout": self._effective_timeout(node, timeout, started_at),
                                         "timeout": timeout,
                                         "split_count": len(shards),
                                     },
@@ -280,7 +401,58 @@ class CollabEngine:
                                     pending[shard.id] = shard
                             continue
 
-                        future = pool.submit(self._run_node_with_retries, run_id, node, self._effective_timeout(node, timeout), max_retries, split_count)
+                        # ── Total run budget check ──────────────────────────
+                        remaining_budget = max(0, timeout - (time.time() - started_at))
+                        if remaining_budget < 30 and completed:
+                            self.store.log(
+                                run_id, "warning",
+                                "run budget running low",
+                                {"remaining_budget": round(remaining_budget, 1),
+                                 "node": node.id},
+                                node.id,
+                            )
+                            self.store.update_node(node.id, "failed",
+                                "budget exhausted",
+                                None, 0.0, None, run_id=run_id)
+                            result = WorkerResult(node.id, node.title, False,
+                                "budget exhausted", None, 0.0, 1, "", node.attempt)
+                            results.append(result)
+                            completed.add(node.id)
+                            self._record_node_result(run_id, result)
+                            self.store.log(run_id, "warning",
+                                "node skipped: budget exhausted",
+                                {"node": node.id,
+                                 "remaining_budget": round(remaining_budget, 1)},
+                                node.id)
+                            # If this skipped node is a proactive shard, record it
+                            # in split_finished so the parent gets reconciled.
+                            _parent_of_skipped = node.parent_id if node.parent_id in split_children else None
+                            if _parent_of_skipped:
+                                split_finished[_parent_of_skipped].add(node.id)
+                                split_results[_parent_of_skipped].extend([result])
+                                if split_children[_parent_of_skipped] <= split_finished[_parent_of_skipped]:
+                                    _p_results = split_results[_parent_of_skipped]
+                                    if any(r.ok for r in _p_results):
+                                        _shard_ids = sorted(split_children[_parent_of_skipped])
+                                        _combined_text, _combined_struct = self._combine_shard_results(
+                                            _parent_of_skipped, _shard_ids,
+                                        )
+                                        self.store.update_node(
+                                            _parent_of_skipped, "completed",
+                                            _combined_text,
+                                            None, None, None, run_id=run_id,
+                                        )
+                                        with self._node_results_lock:
+                                            self._node_results[_parent_of_skipped] = _combined_text
+                                            self._node_results_struct[_parent_of_skipped] = _combined_struct
+                                    else:
+                                        self.store.update_node(_parent_of_skipped, "failed",
+                                            None, None, None,
+                                            "All proactive shards exhausted budget",
+                                            run_id=run_id)
+                            continue
+
+                        future = pool.submit(self._run_node_with_retries, run_id, node, self._effective_timeout(node, timeout, started_at), max_retries, split_count)
                         running[future] = node
                         running_started[future] = time.time()
 
@@ -291,18 +463,26 @@ class CollabEngine:
                         continue
 
                     done, _ = concurrent.futures.wait(running.keys(), timeout=_STALL_CHECK_INTERVAL, return_when=concurrent.futures.FIRST_COMPLETED)
-                    # Stale worker watchdog: cancel futures that have been running too long
+                    # Resource-pressure watchdog: kill the oldest running worker
+                    # when CPU or memory exceeds thresholds.
                     if not done and running:
-                        now = time.time()
-                        for fut, node in list(running.items()):
-                            effective_timeout = self._effective_timeout(node, timeout)
-                            elapsed = now - running_started.get(fut, now)
-                            # Allow 2x the subprocess timeout as a safety margin
-                            if elapsed > effective_timeout * 2:
-                                self.store.log(run_id, "warning", "stale worker watchdog: cancelling hung future",
-                                    {"node": node.id, "elapsed_seconds": round(elapsed), "timeout": effective_timeout}, node.id)
-                                fut.cancel()
-                                done.add(fut)
+                        cpu_pct = self._get_cpu_percent() or 0
+                        mem_pct = self._get_mem_percent() or 0
+                        if self._system_under_pressure(cpu_pct, mem_pct):
+                            oldest_fut = min(running.keys(), key=lambda f: running_started.get(f, float('inf')))
+                            oldest_node = running[oldest_fut]
+                            with self._worker_procs_lock:
+                                proc = self._worker_procs.get(oldest_node.id)
+                                if proc:
+                                    proc.kill()
+                            self._resource_timeout_nodes.add(oldest_node.id)
+                            self.store.log(run_id, "warning",
+                                "worker killed by resource-pressure watchdog",
+                                {"node": oldest_node.id, "cpu": f"{cpu_pct:.0f}%",
+                                 "mem": f"{mem_pct:.0f}%", "elapsed": round(time.time() - running_started.get(oldest_fut, 0), 1)},
+                                oldest_node.id)
+                            oldest_fut.cancel()
+                            done.add(oldest_fut)
                     for fut in done:
                         node = running.pop(fut)
                         running_started.pop(fut, None)
@@ -360,6 +540,32 @@ class CollabEngine:
                         else:
                             failed_final.extend(node_results)
 
+                    # Tier 3: Leader run assessment — if a checkpoint node failed and
+                    # there are still pending nodes, ask the leader whether to continue.
+                    if failed_final and pending:
+                        checkpoint_failed = any(
+                            hasattr(n, 'checkpoint') and n.checkpoint
+                            for n in failed_final
+                        )
+                        if checkpoint_failed:
+                            remaining_ids = list(pending.keys())
+                            failed_ids = [r.node_id for r in failed_final[-5:]]
+                            elapsed = time.time() - started_at
+                            action = self._leader_guard_run(
+                                run_id, request, failed_ids, remaining_ids,
+                                elapsed, timeout,
+                            )
+                            if action == "abort":
+                                self.store.log(run_id, "warning",
+                                    "run aborted by leader guard",
+                                    {"failed_nodes": failed_ids})
+                                for nid in list(pending.keys()):
+                                    self.store.update_node(nid, "failed",
+                                        error="run aborted by leader guard",
+                                        run_id=run_id)
+                                pending.clear()
+                                break
+
             final = None
             if aggregate:
                 final = self._aggregate(run_id, request, results, timeout)
@@ -411,6 +617,7 @@ class CollabEngine:
             self._risk_assessments = []
             self._checkpoint_paused_nodes.clear()
             self._paused_runs.discard(run_id)
+            self._resource_timeout_nodes.clear()
 
     def _node_fingerprint(self, node: WBSNode) -> str:
         if node.fingerprint:
@@ -475,6 +682,10 @@ class CollabEngine:
             return None
         with self._write_targets_lock:
             for node_id, active in self._active_write_targets.items():
+                # Mode E fix: skip self-claims — a claim from a node against itself
+                # is not concurrent and cannot deadlock the same node.
+                if node_id == node.id:
+                    continue
                 if self._targets_overlap(targets, active):
                     return node_id
         return None
@@ -490,33 +701,74 @@ class CollabEngine:
         with self._write_targets_lock:
             self._active_write_targets.pop(node_id, None)
 
-    def _effective_timeout(self, node: WBSNode, timeout: int) -> int:
-        # 2026-06-16 fix: previous formula was `min(timeout, estimated*2)` which let
-        # a 120s estimated cap out the user's 1500s --timeout at 240s. Workers always
-        # died prematurely. New formula: estimated is a *floor* hint, user timeout is
-        # a hard ceiling. We honor at least half the user's timeout so the user can't
-        # accidentally under-budget a node.
+    def _effective_timeout(self, node: WBSNode, timeout: int, started_at: float) -> int:
+        # Cap by remaining run budget so sequential nodes don't cumulatively
+        # exceed the user's --timeout. Minimum 30s so a worker has a viable window.
+        remaining = max(30, int(timeout - (time.time() - started_at)))
         if node.estimated_duration:
             try:
                 estimated_floor = max(1, int(node.estimated_duration) * 2)
             except (TypeError, ValueError):
-                return timeout
-            return min(timeout, max(estimated_floor, timeout // 2))
-        return timeout
+                return min(timeout, remaining)
+            return min(timeout, max(estimated_floor, timeout // 2), remaining)
+        return min(timeout, remaining)
 
-    def _should_split_proactively(self, node: WBSNode, timeout: int, max_retries: int, split_count: int) -> bool:
+    def _should_split_proactively(self, node: WBSNode, timeout: int, max_retries: int, split_count: int, started_at: float) -> bool:
         if split_count <= 1 or not node.estimated_duration:
             return False
         try:
             estimated_timeout = int(node.estimated_duration) * 2
         except (TypeError, ValueError):
             return False
-        return estimated_timeout > timeout
+        remaining = max(1, timeout - (time.time() - started_at))
+        return estimated_timeout > remaining
+
+    # ── Resource monitoring ────────────────────────────────────────────
+    @staticmethod
+    def _get_cpu_percent() -> float | None:
+        """CPU usage % from /proc/stat (user+system vs idle)."""
+        try:
+            with open("/proc/stat") as f:
+                parts = f.readline().split()
+            if parts[0] != "cpu" or len(parts) < 5:
+                return None
+            vals = [int(v) for v in parts[1:9]]
+            total = sum(vals)
+            idle = vals[3]
+            return 100.0 * (1.0 - idle / total) if total else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _get_mem_percent() -> float | None:
+        try:
+            with open("/proc/meminfo") as f:
+                data = {}
+                for line in f:
+                    kv = line.split(":", 1)
+                    if len(kv) == 2:
+                        data[kv[0].strip()] = int(kv[1].strip().split()[0])
+            total = data.get("MemTotal")
+            avail = data.get("MemAvailable")
+            if total and avail:
+                return 100.0 * (1.0 - avail / total)
+            return None
+        except Exception:
+            return None
+
+    def _system_under_pressure(self, cpu_pct: float = 0, mem_pct: float = 0,
+                               cpu_threshold: float = 90, mem_threshold: float = 90) -> bool:
+        try:
+            if not cpu_pct:
+                cpu_pct = self._get_cpu_percent() or 0
+            if not mem_pct:
+                mem_pct = self._get_mem_percent() or 0
+        except Exception:
+            return False
+        return cpu_pct > cpu_threshold or mem_pct > mem_threshold
 
     def _run_node_with_retries(self, run_id: str, node: WBSNode, timeout: int, max_retries: int, split_count: int) -> list[WorkerResult]:
-        # Global semaphore: cap concurrent opencode worker processes across all runs.
-        # This prevents the 4-run storm that previously leaked lsp-daemon children
-        # and OOM'd the 4GB box. Released in finally to avoid slot leaks on any exit.
+        # Global semaphore: cap concurrent worker processes across all runs.
         self._global_worker_sem.acquire()
         try:
             return self._run_node_with_retries_inner(run_id, node, timeout, max_retries, split_count)
@@ -528,8 +780,6 @@ class CollabEngine:
         try:
             parent = self._run_worker(run_id, node, timeout)
         except Exception as exc:
-            # Prevent node from being stuck in 'running' state if _run_worker
-            # raises an unexpected exception (e.g. OSError, ValueError).
             duration = 0.0
             parent = WorkerResult(node.id, node.title, False,
                 f"Worker crashed unexpectedly: {type(exc).__name__}: {exc}",
@@ -537,7 +787,11 @@ class CollabEngine:
             self.store.worker_finish(f"worker_{run_id}_{node.id}_{node.attempt}", "failed", duration, None, str(exc))
             self.store.log(run_id, "error", "worker crashed in _run_node_with_retries",
                 {"node": node.id, "error": str(exc)}, node.id)
-        self.store.update_node(node.id, "completed" if parent.ok else "failed", parent.result, parent.session_id, parent.duration_seconds, None if parent.ok else parent.result, run_id=run_id)
+        self.store.update_node(node.id,
+            "completed" if parent.ok else
+            "timeout" if parent.returncode == 124 else "failed",
+            parent.result, parent.session_id, parent.duration_seconds,
+            None if parent.ok else parent.result, run_id=run_id)
         if parent.ok:
             self._record_node_result(run_id, parent)
         results = [parent]
@@ -545,10 +799,6 @@ class CollabEngine:
             return results
         if parent.returncode == 124 and split_count > 1:
             if self._shard_too_deep(node, run_id=run_id):
-                # Anti-avalanche: this node is already a shard at max depth.
-                # Don't split further — return failure as-is so the caller can
-                # aggregate a real "shard of shard failed" result without
-                # recursive cascade.
                 self.store.log(
                     run_id, "warning",
                     "anti-avalanche: shard at max depth timed out, not re-splitting",
@@ -595,7 +845,113 @@ class CollabEngine:
                     self.store.update_node(res.node_id, "completed" if res.ok else "failed", res.result, res.session_id, res.duration_seconds, None if res.ok else res.result, run_id=run_id)
                     if res.ok:
                         self._record_node_result(run_id, res)
+        # Tier 2: Leader guard retry — if all attempts failed, ask the leader
+        # whether to retry with a modified approach before giving up.
+        if not any(r.ok for r in results):
+            leader_node = self._leader_guard_retry(run_id, node, results[0], node.attempt)
+            if leader_node is not None:
+                self.store.insert_wbs_node(run_id, leader_node.to_dict())
+                self.store.update_node(leader_node.id, "pending", run_id=run_id)
+                leader_result = self._run_worker(run_id, leader_node,
+                    max(30, timeout // 2))
+                self.store.update_node(leader_node.id,
+                    "completed" if leader_result.ok else "failed",
+                    leader_result.result, leader_result.session_id,
+                    leader_result.duration_seconds,
+                    None if leader_result.ok else leader_result.result,
+                    run_id=run_id)
+                if leader_result.ok:
+                    self._record_node_result(run_id, leader_result)
+                    results.append(leader_result)
+                else:
+                    results.append(leader_result)
         return results
+
+    def _leader_guard_retry(self, run_id: str, node: WBSNode, result: WorkerResult,
+                             attempt: int) -> WBSNode | None:
+        """Tier 2: Ask the leader whether to retry a failed node with a modified approach."""
+        prompt = (
+            f"You are the Leader supervising a multi-agent run.\n\n"
+            f"A worker node failed after attempt {attempt}.\n\n"
+            f"Node title: {node.title}\n"
+            f"Capability: {node.capability}\n"
+            f"Original description: {node.description}\n\n"
+            f"Worker output:\n{(result.result or '')[:2000]}\n\n"
+            f"Error: {result.returncode}\n\n"
+            f"Decide whether to retry with a modified approach or give up.\n"
+            f"Return ONLY a JSON object on the final line, prefixed by "
+            f"HERMES-COLLAB-RESULT:\n"
+            f'{{"action":"retry|give_up",'
+            f'"description":"modified node description if retrying; empty if give_up"}}'
+        )
+        try:
+            wr = self._run_worker(run_id, node, 60,
+                                   model_override=self.leader_model, role="leader")
+        except Exception as exc:
+            self.store.log(run_id, "error",
+                           "leader guard crashed", {"node": node.id, "error": str(exc)},
+                           node.id)
+            return None
+        text = wr.result or ""
+        _, parsed = self._parse_result_contract(text)
+        if not isinstance(parsed, dict):
+            return None
+        action = parsed.get("action", "give_up")
+        if action != "retry":
+            return None
+        new_desc = parsed.get("description", "").strip()
+        if not new_desc:
+            return None
+        new_node = WBSNode(
+            id=f"{node.id}-retry-{attempt+1}",
+            title=node.title + " (retry)",
+            description=new_desc,
+            capability=node.capability,
+            complexity=max(1, node.complexity // 2),
+            dependencies=node.dependencies,
+            parallelizable=node.parallelizable,
+            deliverable=node.deliverable,
+        )
+        new_node.estimated_duration = max(30, (node.estimated_duration or 120) // 2)
+        self.store.log(run_id, "warning", "leader decided to retry node",
+                       {"node": node.id, "retry_id": new_node.id,
+                        "description": new_desc[:200]}, node.id)
+        return new_node
+
+    def _leader_guard_run(self, run_id: str, request: str,
+                          failed_node_ids: list[str], remaining_node_ids: list[str],
+                          elapsed: float, timeout: int) -> str:
+        """Tier 3: Ask the leader whether the entire run should continue."""
+        prompt = (
+            f"You are the Leader orchestrating a multi-worker run.\n\n"
+            f"Run request: {request[:500]}\n"
+            f"Elapsed time: {elapsed:.0f}s / Budget: {timeout}s\n\n"
+            f"Failed nodes: {failed_node_ids or 'none'}\n"
+            f"Remaining nodes: {remaining_node_ids or 'none'}\n\n"
+            f"Decide whether to continue with remaining work or abort the run.\n"
+            f"Return ONLY a JSON object on the final line, prefixed by "
+            f"HERMES-COLLAB-RESULT:\n"
+            f'{{"action":"continue|abort","reason":"brief justification"}}'
+        )
+        mock_node = WBSNode(f"{run_id}-guard", "Run guard assessment",
+                            prompt, "planning", 1, [], True, "decision")
+        try:
+            wr = self._run_worker(run_id, mock_node, 30,
+                                   model_override=self.leader_model, role="leader")
+        except Exception as exc:
+            self.store.log(run_id, "error",
+                           "leader run guard crashed", {"error": str(exc)})
+            return "continue"
+        text = wr.result or ""
+        _, parsed = self._parse_result_contract(text)
+        if not isinstance(parsed, dict):
+            return "continue"
+        action = parsed.get("action", "continue")
+        reason = parsed.get("reason", "")
+        if action == "abort":
+            self.store.log(run_id, "warning", "leader aborted the run",
+                           {"reason": reason})
+        return action
 
     def _record_node_result(self, run_id: str, result: WorkerResult) -> None:
         result_text = result.result or ''
@@ -647,31 +1003,8 @@ class CollabEngine:
 
     def _shard_depth_of(self, node: WBSNode, run_id: str | None = None) -> int:
         """Compute how deep a node sits in the shard nesting tree.
-
         Root nodes (no parent_id) are depth 0. A direct shard of a root is
-        depth 1. A shard of a shard is depth 2. Etc.
-
-        Walks the parent_id chain via TWO sources, in order, picking the first
-        that resolves each lookup:
-
-        1. self._plan_nodes_by_id() — full plan, set by run() at the start.
-           Includes original nodes only; NOT shards created by _split_node.
-        2. self.store.get_node(run_id, parent_id) — SQLite lookup. This is
-           the authoritative source for shards that _split_node wrote to db
-           but did NOT add to _current_plan. Without this, the helper would
-           always return 0 for a shard because the plan doesn't know about
-           it. This was the bug that caused the 4-run storm in session
-           20260615_234608_dbad00 to produce unbounded depth-2+ shards.
-
-        `run_id` is needed for the SQLite lookup. Callers from `run()` (which
-        knows the run_id) pass it explicitly. Fallback path: if not provided,
-        we look at node.id's run_id via the plan or skip the db lookup
-        entirely (in which case shard depth is reported as 0, which is
-        wrong but never reached in practice — every caller in engine.py
-        passes run_id).
-
-        Hard cap at _MAX_SHARD_DEPTH + 5 to prevent infinite loops on
-        malformed chains (defense in depth).
+        depth 1. A shard of a shard is depth 2. etc.
         """
         depth = 0
         current_id: str | None = node.id
@@ -681,9 +1014,6 @@ class CollabEngine:
             seen.add(current_id)
             current = by_id.get(current_id)
             if current is None:
-                # Fall back to SQLite. This handles shards that _split_node
-                # created — they were inserted into the store but not added
-                # to _current_plan.nodes (the plan is immutable after run()).
                 row = None
                 if run_id is not None:
                     try:
@@ -691,40 +1021,26 @@ class CollabEngine:
                     except Exception:
                         row = None
                 if row is not None:
-                    # get_node returns a dict; reconstruct a minimal stub
-                    # for the parent_id lookup.
                     parent_id_val = row.get("parent_id") or None
                     depth += 1 if parent_id_val else 0
                     if not parent_id_val:
                         return depth
                     current_id = parent_id_val
                     continue
-                # No plan entry, no db entry — node is orphaned. Treat
-                # as root (depth 0). This should not happen in practice
-                # but we don't want to crash.
                 break
             parent_id = getattr(current, "parent_id", None) or None
             if not parent_id:
                 return depth
             depth += 1
             current_id = parent_id
-            # Hard cap to prevent infinite loops on malformed chains.
             if depth > self._MAX_SHARD_DEPTH + 5:
                 break
         return depth
 
     def _shard_too_deep(self, node: WBSNode, run_id: str | None = None) -> bool:
-        """Anti-avalanche gate: refuse to split a node already at max depth.
-
-        Returns True if `node` is already a shard at depth >= _MAX_SHARD_DEPTH.
-        Callers should treat True as "do not split, return failure as-is".
-        """
         depth = self._shard_depth_of(node, run_id=run_id)
         if depth >= self._MAX_SHARD_DEPTH:
             if self._SHARD_DEPTH_WARN_LOG:
-                # Use store.log when we have a run_id; otherwise stderr.
-                # Callers should pass run_id to store.log, but this helper
-                # doesn't always have it, so we go to stderr for visibility.
                 import sys
                 print(
                     f"[anti-avalanche] refusing to split node {node.id} "
@@ -867,28 +1183,82 @@ class CollabEngine:
         with self._node_results_lock:
             text_snapshot = {dep_id: self._node_results.get(dep_id) for _depth, dep_id in tiers}
             struct_snapshot = {dep_id: self._node_results_struct.get(dep_id) for _depth, dep_id in tiers}
-        kept: list[str] = []
-        remaining = self._UPSTREAM_TOTAL_CAP
+        # Step 1: collect all texts with per-tier caps applied (no total-cap truncation)
+        dep_texts: dict[str, tuple[int, str]] = {}
         for depth, dep_id in tiers:
             text = self._context_text_for_node(dep_id, text_snapshot.get(dep_id), struct_snapshot.get(dep_id))
             if not text:
                 continue
             cap = self._cap_for_tier(depth)
-            snippet = text
-            if len(snippet) > cap:
-                snippet = '[truncated]\n' + snippet[-(cap - len('[truncated]\n')):]
-            if remaining < len(snippet):
-                if remaining <= len('[truncated]\n'):
-                    break
-                snippet = '[truncated]\n' + snippet[-(remaining - len('[truncated]\n')):]
+            if len(text) > cap:
+                text = '[truncated]\n' + text[-(cap - len('[truncated]\n')):]
+            dep_texts[dep_id] = (depth, text)
+        if not dep_texts:
+            return ''
+        # Step 2: build labeled entries
+        kept: list[str] = []
+        for dep_id, (depth, text) in dep_texts.items():
             label = "parent" if depth == 1 else "grandparent" if depth == 2 else f"ancestor depth {depth}"
-            kept.append(f"--- from {dep_id} ({label}) ---\n{snippet}")
+            kept.append(f"--- from {dep_id} ({label}) ---\n{text}")
+        # Step 3: return full context if it fits, otherwise summarize via leader LLM
+        total_size = sum(len(e) for e in kept) + (len(kept) - 1) * 2  # \n\n separators between entries
+        if total_size <= self._UPSTREAM_TOTAL_CAP:
+            return 'Upstream context (from completed dependency nodes):\n' + '\n\n'.join(kept) + '\n\n'
+        summary = self._summarize_context_for_worker({dep_id: text for dep_id, (_, text) in dep_texts.items()})
+        return (
+            'Upstream context (from completed dependency nodes):\n'
+            '--- summarized (full context exceeded capacity) ---\n'
+            f'{summary}\n\n'
+        )
+
+    def _summarize_context_for_worker(self, dep_texts: dict[str, str]) -> str:
+        """Call the leader LLM to produce a ~200-token summary of upstream node results.
+
+        Falls back to head truncation if the LLM call fails or times out.
+        """
+        if not dep_texts:
+            return ''
+        parts = []
+        for dep_id, text in dep_texts.items():
+            parts.append(f"--- {dep_id} ---\n{text[:2000]}")
+        full_text = "\n\n".join(parts)
+        prompt = (
+            "You are summarizing upstream worker results for a downstream worker. "
+            "Produce a concise 200-token summary preserving:\n"
+            "1. Key status and outcomes\n"
+            "2. Files modified or analyzed\n"
+            "3. Verification commands or checks needed\n"
+            "4. Important findings the downstream worker must know\n\n"
+            "Upstream results:\n\n"
+            f"{full_text[:8000]}\n\n"
+            "Summary (200 tokens max, plain text, no JSON):"
+        )
+        cmd = ["claude", "-p", prompt, "--output-format", "json"]
+        if self.leader_model:
+            cmd.extend(["--model", self.leader_model])
+        try:
+            proc = subprocess.run(
+                cmd, cwd=self.cwd, text=True, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30,
+            )
+            if proc.returncode == 0:
+                outer = json.loads(proc.stdout)
+                summary = outer.get("result", "").strip()
+                if summary:
+                    return summary
+        except Exception:
+            pass
+        kept_lines: list[str] = []
+        remaining = 2000
+        for dep_id, text in dep_texts.items():
+            snippet = text
+            if len(snippet) > remaining:
+                snippet = snippet[:remaining]
+            kept_lines.append(f"--- {dep_id} ---\n{snippet}")
             remaining -= len(snippet)
             if remaining <= 0:
                 break
-        if not kept:
-            return ''
-        return 'Upstream context (from completed dependency nodes):\n' + '\n\n'.join(kept) + '\n\n'
+        return "Fallback summary (LLM summarization failed):\n" + "\n\n".join(kept_lines)
 
     def _shared_brief_for_worker(self, node: WBSNode) -> str:
         plan = self._current_plan
@@ -903,79 +1273,6 @@ class CollabEngine:
     def _task_text_for_worker(self, node: WBSNode) -> str:
         return "\n".join(part for part in (node.title, node.deliverable, node.brief, node.description) if part)
 
-    def _skills_for_worker(self, node: WBSNode) -> tuple[list[str], str]:
-        task_text = self._task_text_for_worker(node)
-        # Legacy registry selection
-        selected = self.skill_registry.select_for_node(node.capability, task_text)
-        names = {skill.name for skill in selected}
-        # Bridge: pull web-added entries from UnifiedRegistry (skip built-in "hermes" source)
-        unified = get_unified_registry()
-        for us in unified.select_skills(node.capability, task_text, max_skills=16):
-            if us.name not in names and us.source != "hermes":
-                names.add(us.name)
-                selected.append(us)
-        return list(names), self.skill_registry.render_for_prompt(selected)
-
-    def _tools_for_worker(self, node: WBSNode) -> tuple[list[str], list[str], str]:
-        task_text = self._task_text_for_worker(node)
-        # Legacy registry selection
-        profiles = self.tool_registry.select_for_node(node.capability, task_text)
-        names = {profile.name for profile in profiles}
-        allowed = self.tool_registry.allowed_tools_for_profiles(profiles)
-        # Bridge: pull web-added entries from UnifiedRegistry (skip built-in "hermes" source)
-        unified = get_unified_registry()
-        for ut in unified.select_tools(node.capability, task_text, max_tools=16):
-            if ut.name not in names and ut.source != "hermes":
-                names.add(ut.name)
-                profiles.append(ut)
-                for t in ut.allowed_tools:
-                    if t not in allowed:
-                        allowed.append(t)
-        # Bridge MCP entries: their allowed_tools flow into the tool whitelist
-        for mcp in unified.select_mcp(node.capability, max_entries=8):
-            if mcp.name not in names and mcp.source != "hermes":
-                names.add(mcp.name)
-                profiles.append(mcp)
-                for t in mcp.allowed_tools:
-                    if t not in allowed:
-                        allowed.append(t)
-        return (list(names), allowed, self.tool_registry.render_for_prompt(profiles))
-
-    def _render_skills_from_names(self, names: list[str]) -> str:
-        """Reconstruct the skills prompt block from a list of skill names."""
-        unified = get_unified_registry()
-        skills = []
-        for name in names:
-            entry = self.skill_registry.get(name)
-            if entry is None:
-                # Check unified registry for web-added skills
-                for us in unified.list_by_type(USkillEntry):
-                    if us.name == name:
-                        entry = us
-                        break
-            if entry is not None:
-                skills.append(entry)
-        return self.skill_registry.render_for_prompt(skills)
-
-    def _render_tools_from_names(self, names: list[str]) -> tuple[list[str], str]:
-        """Reconstruct the tools prompt block and allowed_tools from profile names."""
-        unified = get_unified_registry()
-        profiles = []
-        allowed: list[str] = []
-        for name in names:
-            entry = self.tool_registry.get(name)
-            if entry is None:
-                for ut in unified.list_by_type(UToolEntry) + unified.list_by_type(UMCPEntry):
-                    if ut.name == name:
-                        entry = ut
-                        break
-            if entry is not None:
-                profiles.append(entry)
-                for t in getattr(entry, 'allowed_tools', []):
-                    if t not in allowed:
-                        allowed.append(t)
-        return allowed, self.tool_registry.render_for_prompt(profiles)
-
     def _preallocate_skills_tools(self, run_id: str, nodes: list[WBSNode]) -> None:
         """Pre-compute skills/tools for all nodes before workers start.
 
@@ -986,29 +1283,43 @@ class CollabEngine:
         Filters out built-in (source="hermes") entries that overlap with
         the agent's native capabilities.  Non-built-in entries (web-ui, mcp,
         etc.) are always preserved regardless of capability overlap.
+
+        If the run was triggered via a package (Leader selected a scenario
+        bundle), the package's Skill collection is treated as the canonical
+        skill set for *every* node unless a node already has skills_json.
         """
         native_caps = set(self.agent_backend.capabilities)
+        package_meta = {}
+        package_skills: list[str] = []
         for node in nodes:
             try:
-                # Respect leader-assigned values; only fill gaps via registry
-                if not node.skills_json:
-                    skill_names, _skills_block = self._skills_for_worker(node)
-                    node.skills_json = json.dumps(skill_names)
-                if not node.tools_json:
-                    tool_profile_names, _tool_allowed, _tools_block = self._tools_for_worker(node)
-                    node.tools_json = json.dumps(tool_profile_names)
-                # Filter out built-in SKILLS already covered by native capabilities.
-                # Do NOT filter tool profiles — they are permission whitelists,
-                # not capability indicators. Removing them would strip the worker
-                # of necessary permissions (e.g., Read/Edit/Write).
-                if native_caps:
+                # Respect leader-assigned values; only fill gaps via distributor
+                if not node.skills_json or not node.tools_json:
+                    # Determine leader_skills for the distributor:
+                    #   1. Leader-assigned skills_json on the node
+                    #   2. Package-level skills (scenario override)
+                    #   3. None → fall back to capability default
                     if node.skills_json:
-                        skill_names = json.loads(node.skills_json)
-                        skill_names = [
-                            n for n in skill_names
-                            if not (n in native_caps and self._is_hermes_builtin_skill(n))
-                        ]
+                        leader_skills = json.loads(node.skills_json)
+                    elif package_skills:
+                        leader_skills = list(package_skills)
+                    else:
+                        leader_skills = None
+
+                    skill_names, tool_profile_names = self._skill_distributor.resolve_for_node(
+                        node_capability=node.capability,
+                        leader_skills=leader_skills,
+                        agent_backend=self.agent_backend,
+                    )
+                    if not node.skills_json:
                         node.skills_json = json.dumps(skill_names)
+                    if not node.tools_json:
+                        node.tools_json = json.dumps(tool_profile_names)
+
+                # Native capability overlap filtering is intentionally disabled.
+                # Even when an agent has a native capability (e.g. file-edit),
+                # the skill content provides task-specific guidance that is
+                # still useful to the worker (e.g. "make the smallest change").
                 self.store.update_node_skills_tools(node.id, node.skills_json, node.tools_json)
             except Exception:
                 # Pre-allocation failure is non-fatal; worker falls back to per-worker selection
@@ -1042,7 +1353,7 @@ class CollabEngine:
         provider = getattr(self, 'provider', None)
 
         if provider is not None:
-            from .provider import env_targets_for_protocol, apply_provider_to_env
+            from .provider import env_targets_for_protocol, apply_provider_to_env  # type: ignore[import-not-found]
             targets = env_targets_for_protocol(provider.protocol)
             # 1. Role-prefixed overrides (HERMES_COLLAB_WORKER_*) from base env
             for source_suffix, target_keys in targets.items():
@@ -1067,6 +1378,7 @@ class CollabEngine:
                 else:
                     env["ANTHROPIC_MODEL"] = model_val
         else:
+            # 1. Role-prefixed env var overrides (no provider)
             value_map = {
                 "API_KEY": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
                 "AUTH_TOKEN": ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"),
@@ -1079,13 +1391,55 @@ class CollabEngine:
                     continue
                 for target in targets:
                     env[target] = value
-            # Always override ANTHROPIC_MODEL with the instance attribute,
-            # which already resolved CLI args > env vars correctly in __init__.
-            # This prevents stale HERMES_COLLAB_*_MODEL env vars from poisoning workers.
+            # Always override ANTHROPIC_MODEL with the instance attribute
             if role == "worker" and self.worker_model:
                 env["ANTHROPIC_MODEL"] = self.worker_model
             elif role == "leader" and self.leader_model:
                 env["ANTHROPIC_MODEL"] = self.leader_model
+        # 2. Profile-based values with fallback chain
+        profile = self._leader_profile if role == "leader" else self._worker_profile
+        if profile is not None:
+            runtime_config: dict[str, Any] | None = None
+            runtime_config_path = self.cwd / ".runtime-config.json"
+            if runtime_config_path.is_file():
+                try:
+                    with open(runtime_config_path) as f:
+                        runtime_config = json.load(f)
+                except (json.JSONDecodeError, OSError):
+                    pass
+            _ANTHROPIC_DEFAULTS: dict[str, str] = {
+                "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+            }
+            field_map: dict[str, str] = {
+                "base_url": "ANTHROPIC_BASE_URL",
+                "api_key": "ANTHROPIC_API_KEY",
+                "model": "ANTHROPIC_MODEL",
+            }
+            for profile_key, env_key in field_map.items():
+                profile_val = profile.get(profile_key)
+                if profile_val:
+                    env[env_key] = profile_val
+                elif runtime_config and env_key in runtime_config:
+                    env[env_key] = runtime_config[env_key]
+                elif env_key not in env:
+                    default = _ANTHROPIC_DEFAULTS.get(env_key)
+                    if default:
+                        env[env_key] = default
+        # When using opencode backend, mirror ANTHROPIC_* env vars as
+        # OPENCODE_* so the subprocess can pick them up correctly.
+        if self.agent_backend.name == "opencode":
+            _opc_src_map = {
+                "ANTHROPIC_BASE_URL": "OPENCODE_BASE_URL",
+                "ANTHROPIC_API_KEY": "OPENCODE_API_KEY",
+            }
+            for _src, _dst in _opc_src_map.items():
+                if _src in env:
+                    env[_dst] = env[_src]
+        # Apply reasoning env vars from the agent backend
+        for _k, _v in self.agent_backend.reasoning_env.items():
+            if _v:
+                env[_k] = _v
+        # 3. Git credentials
         git_value_map = {
             "GIT_TOKEN": "HERMES_COLLAB_GIT_TOKEN",
             "GIT_USERNAME": "HERMES_COLLAB_GIT_USERNAME",
@@ -1138,33 +1492,18 @@ class CollabEngine:
     def _force_kill_subprocess_tree(self, exc: "subprocess.TimeoutExpired | None", tmp_path: str | None, *, worker_role: str = "worker") -> None:
         """Kill the whole process group of a timed-out subprocess and clean up tmp files.
 
-        Why this is needed:
-        - `subprocess.run(..., start_new_session=True, stdout=PIPE, stderr=PIPE, timeout=T)`
-          creates a new session and runs the command in it. When the timeout fires,
-          Python sends SIGKILL to the child and tries to reap it. But the child may have
-          spawned grandchildren (e.g. omo lsp-daemon) that still hold the read end of
-          stdout/stderr. Those grandchildren will block forever writing to a pipe whose
-          read end was just closed. Even if SIGKILL propagates via pgid, the grandchildren
-          can be in a state where they're stuck in write() on a full pipe buffer.
-        - Solution: killpg the whole pgid, then close the pipe fds we hold so any
-          remaining writers get EPIPE and exit cleanly.
-
-        This is the bug that leaked 8+ lsp-daemon child processes during the 4-run storm
-        in session 20260615_234608_dbad00, eating ~400MB of RAM and causing the 4GB
-        machine to swap-thrash for 35 minutes.
+        Uses subprocess.Popen + communicate() for worker execution so the
+        process pid is available for killpg when a timeout fires.
         """
         import os
         import signal
         import gc
 
-        # 1. Kill the entire process group of the timed-out subprocess.
-        #    exc.__subprocess_pid was added in 3.13; fall back to None for older.
         pgid_pid = None
         if exc is not None and hasattr(exc, "__subprocess_pid"):
             pgid_pid = exc.__subprocess_pid  # type: ignore[attr-defined]
         if pgid_pid is None:
-            # We don't know the pid from exc. Use ps to find any zombie opencode
-            # children of this process and kill them by their pgrp.
+            # Fallback: use psutil to find children
             try:
                 import psutil  # type: ignore
             except ImportError:
@@ -1174,7 +1513,6 @@ class CollabEngine:
                     parent = psutil.Process(os.getpid())
                     for child in parent.children(recursive=True):
                         try:
-                            # Best-effort: if it's a leader of its own pgrp, kill it
                             if child.pid != child.ppid:
                                 os.killpg(child.pid, signal.SIGKILL)
                         except (ProcessLookupError, PermissionError, OSError):
@@ -1182,40 +1520,119 @@ class CollabEngine:
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
         else:
-            # We have the pid → kill the whole pgrp it leads.
             try:
                 os.killpg(pgid_pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError, OSError):
-                # pgid may already be gone or the child may not be a pgrp leader.
-                # Try direct SIGKILL on the pid as a fallback.
                 try:
                     os.kill(pgid_pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError, OSError):
                     pass
 
-        # 2. Close the pipe fds we (parent) hold. Any grandchildren still
-        #    holding write ends will get EPIPE and exit.
         if exc is not None:
             for stream in (getattr(exc, "stdout", None), getattr(exc, "stderr", None)):
                 if stream is None:
                     continue
-                # exc.stdout/stderr may be a string (text=True) or bytes/None.
-                # We can't actually close them here since exc owns them, but
-                # we can drop the local reference and force gc.
                 try:
                     stream.close() if hasattr(stream, "close") else None
                 except Exception:
                     pass
 
-        # 3. Force a gc cycle to release any lingering file descriptors.
         gc.collect()
 
-        # 4. Clean up the temp prompt file if any.
         if tmp_path:
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+    def _parse_result_contract(self, text: str) -> tuple[dict[str, Any] | None, str | None]:
+        """Parse the HERMES-COLLAB-RESULT contract line from worker output.
+
+        Lenient parser with soft fallback — when the contract is missing or
+        invalid, returns a synthetic struct so downstream code can continue.
+        """
+        scan_text = text[-8192:] if len(text) > 8192 else text
+        marker_idx = scan_text.rfind(self._RESULT_MARKER)
+        if marker_idx < 0:
+            for variant in ("HERMES-COLLAB-RESULT", "Hermes-Result:",
+                           "HERMES_RESULT:", "RESULT:", "H-C-RESULT:"):
+                idx = scan_text.rfind(variant)
+                if idx >= 0:
+                    marker_idx = idx
+                    break
+        if marker_idx >= 0:
+            raw = scan_text[marker_idx:].split(":", 1)[-1].strip()
+            if raw.startswith("```"):
+                raw = raw.strip("`").lstrip("json").strip()
+            for line in raw.splitlines():
+                line = line.strip().rstrip(",")
+                if not line:
+                    continue
+                if line.startswith("{"):
+                    parsed = self._try_parse_json(line)
+                    if parsed is not None:
+                        return parsed, None
+            parsed = self._try_parse_json(raw)
+            if parsed is not None:
+                return parsed, None
+        parsed = self._extract_first_json_object(scan_text)
+        if parsed is not None:
+            return parsed, None
+        summary = text.strip()[:240] if text else ""
+        soft = {
+            "status": "ok",
+            "summary": summary,
+            "files_modified": [],
+            "verification": [],
+            "notes": [
+                "contract missing or invalid — engine synthesised a soft "
+                "result_struct from raw worker text"
+            ],
+        }
+        return soft, None
+
+    @staticmethod
+    def _try_parse_json(text: str) -> dict[str, Any] | None:
+        """Try json.loads with progressively looser escape repair."""
+        try:
+            v = json.loads(text)
+            return v if isinstance(v, dict) else None
+        except json.JSONDecodeError:
+            pass
+        for transform in (
+            lambda s: s.replace("\n", "\\n").replace("\t", "\\t"),
+            lambda s: s.replace("\\", "\\\\"),
+        ):
+            try:
+                v = json.loads(transform(text))
+                return v if isinstance(v, dict) else None
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _extract_first_json_object(text: str) -> dict[str, Any] | None:
+        """Find the first balanced ``{...}`` in `text` and parse it."""
+        depth = 0
+        start: int | None = None
+        for i, ch in enumerate(text):
+            if ch == "{":
+                if start is None:
+                    start = i
+                depth += 1
+            elif ch == "}":
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start is not None:
+                        candidate = text[start : i + 1]
+                        try:
+                            v = json.loads(candidate)
+                            if isinstance(v, dict):
+                                return v
+                        except json.JSONDecodeError:
+                            pass
+                        start = None
+        return None
 
     def _run_worker(self, run_id: str, node: WBSNode, timeout: int, model_override: str | None = None, role: str = "worker") -> WorkerResult:
         worker_id = f"worker_{run_id}_{node.id}_{node.attempt}"
@@ -1225,16 +1642,24 @@ class CollabEngine:
         upstream_block = self._build_upstream_context(node)
         shared_brief_block = self._shared_brief_for_worker(node)
         brief_block = f"Brief:\n{node.brief}\n\n" if node.brief else ""
-        if node.skills_json:
+        if node.skills_json and node.tools_json:
             skill_names = json.loads(node.skills_json)
-            skills_block = self._render_skills_from_names(skill_names)
-        else:
-            skill_names, skills_block = self._skills_for_worker(node)
-        if node.tools_json:
             tool_profile_names = json.loads(node.tools_json)
-            tool_allowed, tools_block = self._render_tools_from_names(tool_profile_names)
         else:
-            tool_profile_names, tool_allowed, tools_block = self._tools_for_worker(node)
+            # Fallback: resolve both via SkillDistributor when either is missing
+            skill_names, tool_profile_names = self._skill_distributor.resolve_for_node(
+                node_capability=node.capability,
+                leader_skills=None,
+                agent_backend=self.agent_backend,
+            )
+            node.skills_json = json.dumps(skill_names)
+            node.tools_json = json.dumps(tool_profile_names)
+        mcp_servers = self._skill_distributor.resolve_mcp(skill_names, self.agent_backend.name)
+        skills_block, tools_block, mcp_block = self._skill_distributor.render_for_prompt(
+            skill_names, tool_profile_names, mcp_servers,
+        )
+        # Resolve allowed_tools for the tool whitelist
+        tool_allowed = tool_profile_names
         backend = self.agent_backend
         # Tool manager acts as whitelist: if profiles matched, use only their tools;
         # if no profiles matched, fall back to backend defaults
@@ -1256,7 +1681,7 @@ WBS node: {node.title}
 Capability: {node.capability}
 Deliverable: {node.deliverable}
 
-{skills_block}{tools_block}{write_block}{shared_brief_block}{brief_block}{upstream_block}Task:
+{skills_block}{tools_block}{mcp_block}{write_block}{shared_brief_block}{brief_block}{upstream_block}Task:
 {node.description}
 
 Work in cwd: {self.cwd}
@@ -1268,9 +1693,12 @@ Output contract:
 - Use this JSON shape: {{"status":"ok|blocked|failed","summary":"short result summary","files_modified":["path"],"verification":["command or check"],"notes":["optional note"]}}
 {backend.prompt_suffix}"""
         selected_model = model_override or self.worker_model
-        # If prompt is too long for command-line args, use stdin via temp file
+        # If prompt is too long for command-line args, use stdin via temp file.
+        # Only applies to backends with a prompt_flag (e.g. claude -p "...");
+        # positional-arg backends (opencode run "...") take prompt directly
+        # as a positional subprocess argument, which is safe up to ARG_MAX (~2MB).
         _PROMPT_ARG_MAX = 100_000  # conservative limit for -p argument
-        use_stdin = len(prompt.encode("utf-8", errors="replace")) > _PROMPT_ARG_MAX
+        use_stdin = bool(backend.prompt_flag) and len(prompt.encode("utf-8", errors="replace")) > _PROMPT_ARG_MAX
         tmp_path: str | None = None
         if use_stdin:
             import tempfile
@@ -1283,6 +1711,7 @@ Output contract:
                 model=selected_model,
                 allowed_tools=final_allowed,
                 provider=self.provider,
+                reasoning=True,
             )
         else:
             cmd = backend.build_command(
@@ -1290,37 +1719,91 @@ Output contract:
                 model=selected_model,
                 allowed_tools=final_allowed,
                 provider=self.provider,
+                reasoning=True,
             )
+        stdin_data = open(tmp_path, "r").read() if tmp_path else None
+        # 2026-06-19 fix: Use temp files instead of PIPE for stdout/stderr.
+        # PIPE-based proc.communicate() hangs forever if the subprocess forks
+        # a daemon that inherits the pipe FD — EOF never arrives. Temp files
+        # eliminate the dependency on pipe EOF entirely. The subprocess writes
+        # to files, so even if it forks daemon children, the files close properly
+        # when the subprocess exits. proc.communicate(timeout=T) then reliably
+        # raises TimeoutExpired.
+        import tempfile as _tf
+        _tmp_stdout = _tf.NamedTemporaryFile(mode="w+", suffix=".out", delete=False, encoding="utf-8")
+        _tmp_stderr = _tf.NamedTemporaryFile(mode="w+", suffix=".err", delete=False, encoding="utf-8")
+        _tmp_stdout_path = _tmp_stdout.name
+        _tmp_stderr_path = _tmp_stderr.name
+        run_kwargs = {
+            "cwd": self.cwd,
+            "env": self._env_for_role(role),
+            "text": True,
+            "stdout": _tmp_stdout,
+            "stderr": _tmp_stderr,
+            "start_new_session": True,
+        }
+        if use_stdin:
+            run_kwargs["input"] = stdin_data
+        else:
+            run_kwargs["stdin"] = subprocess.DEVNULL
+        # Use Popen so external code can kill the process tree
+        proc = subprocess.Popen(cmd, **run_kwargs)
+        # Close the temp file handles in the parent so the subprocess is sole writer.
+        _tmp_stdout.close()
+        _tmp_stderr.close()
+        with self._worker_procs_lock:
+            self._worker_procs[node.id] = proc
         try:
-            stdin_data = open(tmp_path, "r").read() if tmp_path else None
-            run_kwargs = {
-                "cwd": self.cwd,
-                "env": self._env_for_role(role),
-                "text": True,
-                "stdout": subprocess.PIPE,
-                "stderr": subprocess.PIPE,
-                "timeout": timeout,
-                "start_new_session": True,  # isolate process group so timeout kills entire tree
-            }
-            if use_stdin:
-                run_kwargs["input"] = stdin_data
-            else:
-                run_kwargs["stdin"] = subprocess.DEVNULL
-            proc = subprocess.run(cmd, **run_kwargs)
+            child_stdout, child_stderr = proc.communicate(timeout=timeout)
             duration = round(time.time() - started, 3)
+            # Read output from temp files
+            try:
+                with open(_tmp_stdout_path, "r", encoding="utf-8") as _f:
+                    _stdout_text = _f.read()
+                with open(_tmp_stderr_path, "r", encoding="utf-8") as _f:
+                    _stderr_text = _f.read()
+            except (FileNotFoundError, OSError):
+                _stdout_text = ""
+                _stderr_text = ""
+            proc.stdout = _stdout_text
+            proc.stderr = _stderr_text
         except subprocess.TimeoutExpired as exc:
-            # Belt-and-suspenders: subprocess.run + start_new_session=True may leave
-            # grandchildren (lsp-daemon, mcp tool child) holding stdout/stderr pipes,
-            # causing the process to never exit. Force-kill the entire process group
-            # and close pipes so writers get EPIPE and exit.
             self._force_kill_subprocess_tree(exc, tmp_path, worker_role=role)
             duration = round(time.time() - started, 3)
-            result = WorkerResult(node.id, node.title, False, f"Timed out after {timeout}s", None, duration, 124, (exc.stderr or "") if isinstance(exc.stderr, str) else "", node.attempt)
+            try:
+                with open(_tmp_stdout_path, "r", encoding="utf-8") as _f:
+                    _stdo = _f.read()
+            except (FileNotFoundError, OSError):
+                _stdo = ""
+            try:
+                with open(_tmp_stderr_path, "r", encoding="utf-8") as _f:
+                    _stde = _f.read()
+            except (FileNotFoundError, OSError):
+                _stde = ""
+            result = WorkerResult(node.id, node.title, False, f"Timed out after {timeout}s", None, duration, 124, _stde, node.attempt)
             self.store.worker_finish(worker_id, "timeout", duration, None, result.result)
             self.store.log(run_id, "warning", "worker timeout", result.to_dict(), node.id)
+            for _p in (_tmp_stdout_path, _tmp_stderr_path):
+                try: os.unlink(_p)
+                except OSError: pass
+            return result
+        finally:
+            with self._worker_procs_lock:
+                self._worker_procs.pop(node.id, None)
+            for _p in (_tmp_stdout_path, _tmp_stderr_path):
+                try: os.unlink(_p)
+                except OSError: pass
+
+        # Check if this worker was killed by the resource-pressure watchdog
+        if node.id in self._resource_timeout_nodes:
+            self._resource_timeout_nodes.discard(node.id)
+            result = WorkerResult(node.id, node.title, False,
+                "timeout: system resource pressure", None, duration, 124, "", node.attempt)
+            self.store.worker_finish(worker_id, "timeout", duration, None, result.result)
+            self.store.log(run_id, "warning", "worker killed by resource-pressure watchdog",
+                {"node": node.id, "duration": round(duration, 1)}, node.id)
             return result
 
-        text = proc.stdout.strip()
         # Use agent backend to parse output
         parsed = self.agent_backend.parse_output(
             stdout=proc.stdout,
@@ -1335,12 +1818,23 @@ Output contract:
         text = parsed["result"]
         session_id = parsed["session_id"]
         result_struct, contract_error = self._parse_result_contract(text)
-        if ok and contract_error:
-            self.store.log(run_id, "warning", "worker result contract missing or invalid", {"node": node.id, "error": contract_error}, node.id)
+        # On 2026-06-17 the parser was made lenient: it almost always
+        # returns a usable struct (possibly a soft fallback) and
+        # contract_error is usually None. The lesson is recorded only
+        # when the parser actually had to fall back, which we can
+        # detect from the soft-fallback note in the struct.
+        used_soft_fallback = bool(
+            result_struct
+            and result_struct.get("notes")
+            and any("soft" in n.lower() for n in result_struct["notes"])
+        )
+        if ok and (contract_error or used_soft_fallback):
+            reason = contract_error or "soft fallback used (no contract found)"
+            self.store.log(run_id, "warning", "worker result contract missing or invalid", {"node": node.id, "error": reason}, node.id)
             self.store.add_lesson(
                 "worker-contract",
-                "Workers must end successful output with a valid HERMES-COLLAB-RESULT JSON line so downstream context can use structured summaries.",
-                {"run_id": run_id, "node": node.id, "error": contract_error},
+                "Workers should end successful output with a valid HERMES-COLLAB-RESULT JSON line so downstream context can use structured summaries.",
+                {"run_id": run_id, "node": node.id, "error": reason},
             )
         result = WorkerResult(node.id, node.title, ok, text, session_id, duration, proc.returncode, proc.stderr.strip(), node.attempt, result_struct)
         self.store.worker_finish(worker_id, "completed" if ok else "failed", duration, session_id, None if ok else text)
@@ -1358,35 +1852,34 @@ Output contract:
         )
         self.store.log(run_id, "info" if ok else "error", "worker finished", result.to_dict(), node.id)
         if tmp_path:
-            import os
             try: os.unlink(tmp_path)
             except OSError: pass
         return result
-
-    def _parse_result_contract(self, text: str) -> tuple[dict[str, Any] | None, str | None]:
-        marker_index = text.rfind(self._RESULT_MARKER)
-        if marker_index < 0:
-            return None, "missing HERMES-COLLAB-RESULT marker"
-        raw = text[marker_index + len(self._RESULT_MARKER):].strip()
-        if not raw:
-            return None, "empty HERMES-COLLAB-RESULT payload"
-        line = raw.splitlines()[0].strip()
-        if line.startswith("```") and len(raw.splitlines()) > 1:
-            line = raw.splitlines()[1].strip()
-        try:
-            parsed = json.loads(line)
-        except json.JSONDecodeError as exc:
-            return None, f"invalid HERMES-COLLAB-RESULT JSON: {exc}"
-        if not isinstance(parsed, dict):
-            return None, "HERMES-COLLAB-RESULT payload is not an object"
-        return parsed, None
 
     def _aggregate(self, run_id: str, request: str, results: list[WorkerResult], timeout: int) -> WorkerResult:
         node = WBSNode(f"{run_id}-aggregate", "Aggregate results", "Aggregate worker outputs into final answer", "aggregation", 5, [], False, "Final answer")
         self.store.insert_wbs_node(run_id, node.to_dict())
         self.store.update_node(node.id, "running", run_id=run_id)
         report = json.dumps([r.to_dict() for r in results], ensure_ascii=False, indent=2)
-        node.description = f"Original request:\n{request}\n\nWorker results:\n{report}\n\nProduce final concise report. Mention timeouts and shard coverage honestly."
+        # Surface the Leader-selected package + Skill collection so the
+        # aggregator has the full context when writing the final report.
+        meta = {}
+        package_name = meta.get("package")
+        package_skills = list(meta.get("package_skills") or [])
+        package_block = ""
+        if package_name or package_skills:
+            skills_line = ", ".join(package_skills) if package_skills else "(no skills recorded)"
+            package_block = (
+                f"\n\nLeader-selected scenario:\n"
+                f"- Package: {package_name or '(none)'}\n"
+                f"- Triggered Skill collection: {skills_line}\n"
+                f"When writing the final answer, mention the scenario bundle that was used so the operator can see which Skill set Leader activated.\n"
+            )
+        node.description = (
+            f"Original request:\n{request}\n\nWorker results:\n{report}\n\n"
+            f"Produce final concise report. Mention timeouts and shard coverage honestly."
+            f"{package_block}"
+        )
         return self._run_worker(run_id, node, timeout, model_override=self.leader_model, role="leader")
 
     def _learn(self, run_id: str, results: list[WorkerResult]) -> None:

@@ -47,11 +47,16 @@ class AgentBackendDataclassTests(unittest.TestCase):
         self.assertIn("test", cmd)
         self.assertIn("--model", cmd)
 
-    def test_build_command_opencode_no_model_flag(self):
+    def test_build_command_opencode_with_model_flag(self):
         b = get_backend("opencode")
         cmd = b.build_command(prompt="test", model="some-model")
         self.assertEqual(cmd[0], "opencode")
-        self.assertNotIn("--model", cmd)  # opencode doesn't support model flag
+        self.assertIn("--model", cmd)
+        self.assertIn("opencode-go/some-model", cmd)
+        # Verify no double-prefix when model already carries it
+        cmd2 = b.build_command(prompt="test", model="opencode-go/some-model")
+        model_idx = cmd2.index("--model") + 1
+        self.assertEqual(cmd2[model_idx], "opencode-go/some-model")
 
     def test_parse_claude_json_valid(self):
         b = get_backend("claude-code")
@@ -120,9 +125,8 @@ class AgentRegistryTests(unittest.TestCase):
     def test_detect_available_excludes_missing(self):
         available = detect_available_backends()
         names = {b.name for b in available}
-        # codex and opencode are not installed
+        # codex is not installed
         self.assertNotIn("codex", names)
-        self.assertNotIn("opencode", names)
 
     def test_register_custom_backend(self):
         custom = AgentBackend(

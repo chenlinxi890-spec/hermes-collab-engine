@@ -48,6 +48,15 @@ class AgentBackend:
     capabilities: list[str] = field(default_factory=list)  # e.g. ["file-edit","git-ops","test-run"]
     enabled: bool = True
     provider: Any = None  # Optional ProviderProfile instance (imported lazily to avoid cycle)
+    reasoning_flags: list[str] = field(default_factory=list)  # CLI flags for max reasoning, e.g. ["--variant", "max"]
+    reasoning_env: dict[str, str] = field(default_factory=dict)  # Env vars for max reasoning
+    supported_skills: list[str] = field(default_factory=list)  # skill names this agent can use; empty = all
+    supported_tools: list[str] = field(default_factory=list)   # tool/MCP profile names this agent can use; empty = all
+    supported_skill_slots: list[str] = field(default_factory=lambda: [
+        "implementation-focus", "test-verify", "search-verify",
+        "debug-root-cause", "risk-checkpoint", "browser-automation",
+    ])  # skill slots this agent can fill (used by SkillDistributor)
+    auto_prefix: str = ""  # e.g. "opencode-go/" — applied automatically when no provider is set
 
     def build_command(
         self,
@@ -55,12 +64,16 @@ class AgentBackend:
         model: str | None = None,
         allowed_tools: list[str] | None = None,
         provider: Any = None,
+        reasoning: bool = True,
     ) -> list[str]:
         """Build the full command to invoke this agent.
 
         If *provider* carries a ``model_prefix`` (e.g. ``"opencode-go/"``),
         it is prepended to the model value when building the ``--model`` flag.
         Falls back to ``self.provider`` if *provider* is not passed.
+
+        When *reasoning* is ``True`` (default), backend-specific reasoning CLI
+        flags (``self.reasoning_flags``) are appended to the command.
         """
         cmd = list(self.command)
         # If prompt_flag is empty, treat the prompt as a positional arg (e.g. `opencode run "prompt"`)
@@ -79,9 +92,13 @@ class AgentBackend:
                 # Late import to avoid circular dependency
                 from .provider import build_model_flag_value
                 model_arg = build_model_flag_value(model, effective_provider)
+            elif self.auto_prefix and not model.startswith(self.auto_prefix):
+                model_arg = self.auto_prefix + model
             else:
                 model_arg = model
             cmd.extend([self.model_flag, model_arg])
+        if reasoning and self.reasoning_flags:
+            cmd.extend(self.reasoning_flags)
         return cmd
 
     def parse_output(
@@ -213,6 +230,8 @@ _register_builtin(AgentBackend(
     prompt_suffix="",
     default_allowed_tools=["Read", "Edit", "Write", "MultiEdit", "Bash(*)"],
     capabilities=["file-edit", "git-ops", "test-run", "mcp-host", "search"],
+    reasoning_flags=[],
+    reasoning_env={"ANTHROPIC_THINKING_BUDGET": "32000"},
 ))
 _register_builtin(AgentBackend(
     name="codex",
@@ -230,6 +249,8 @@ _register_builtin(AgentBackend(
     prompt_suffix="",
     default_allowed_tools=[],
     capabilities=["file-edit", "git-ops"],
+    reasoning_flags=[],
+    reasoning_env={},
 ))
 _register_builtin(AgentBackend(
     name="opencode",
@@ -237,7 +258,7 @@ _register_builtin(AgentBackend(
     command=["opencode", "run"],
     prompt_flag="",
     output_format_flags=[],
-    supports_model_flag=False,
+    supports_model_flag=True,
     model_flag="--model",
     permission_flags=None,
     allowed_tools_flag=None,
@@ -247,6 +268,9 @@ _register_builtin(AgentBackend(
     prompt_suffix="",
     default_allowed_tools=[],
     capabilities=["file-edit", "git-ops"],
+    reasoning_flags=["--variant", "max"],
+    reasoning_env={},
+    auto_prefix="opencode-go/",
 ))
 _register_builtin(AgentBackend(
     name="hermes",
@@ -264,6 +288,71 @@ _register_builtin(AgentBackend(
     prompt_suffix="",
     default_allowed_tools=[],
     capabilities=["planning", "analysis", "orchestration", "delegation", "file-edit", "git-ops", "search"],
+    reasoning_flags=[],
+    reasoning_env={"HERMES_REASONING_EFFORT": "high"},
+))
+
+
+_register_builtin(AgentBackend(
+    name="windsurf",
+    display_name="Windsurf",
+    command=["windsurf"],
+    prompt_flag="-p",
+    output_format_flags=[],
+    supports_model_flag=True,
+    model_flag="--model",
+    permission_flags=None,
+    allowed_tools_flag=None,
+    output_parser="raw_text",
+    process_pattern="windsurf",
+    prompt_prefix="You are a Windsurf worker in a Hermes collaboration engine.",
+    prompt_suffix="",
+    default_allowed_tools=[],
+    capabilities=["file-edit", "search", "git-ops"],
+    reasoning_flags=[],
+    reasoning_env={},
+))
+
+
+_register_builtin(AgentBackend(
+    name="copilot",
+    display_name="GitHub Copilot",
+    command=["copilot"],
+    prompt_flag="--prompt",
+    output_format_flags=[],
+    supports_model_flag=True,
+    model_flag="--model",
+    permission_flags=None,
+    allowed_tools_flag=None,
+    output_parser="raw_text",
+    process_pattern="copilot",
+    prompt_prefix="You are a GitHub Copilot worker in a Hermes collaboration engine.",
+    prompt_suffix="",
+    default_allowed_tools=[],
+    capabilities=["file-edit", "search", "git-ops", "test-run"],
+    reasoning_flags=[],
+    reasoning_env={},
+))
+
+
+_register_builtin(AgentBackend(
+    name="openclaw",
+    display_name="OpenClaw",
+    command=["openclaw"],
+    prompt_flag="--prompt",
+    output_format_flags=[],
+    supports_model_flag=True,
+    model_flag="--model",
+    permission_flags=None,
+    allowed_tools_flag=None,
+    output_parser="raw_text",
+    process_pattern="openclaw",
+    prompt_prefix="You are a OpenClaw worker in a Hermes collaboration engine.",
+    prompt_suffix="",
+    default_allowed_tools=[],
+    capabilities=["file-edit", "search", "git-ops", "test-run"],
+    reasoning_flags=[],
+    reasoning_env={},
 ))
 
 

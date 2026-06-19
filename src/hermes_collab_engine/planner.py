@@ -2,20 +2,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from .models import ComplexityScore, Plan, WBSNode
 from .registry import MCPEntry, SkillEntry, ToolEntry, get_unified_registry
 
 
 class Planner:
-    def __init__(self, cwd: Path, model: str | None = None, timeout: int = 120, store=None):
+    def __init__(self, cwd: Path, model: str | None = None, timeout: int = 120, store=None,
+                 skill_registry=None, tool_registry=None):
         self.cwd = cwd
         self.model = model
         self.timeout = timeout
         self.store = store
+        self.skill_registry = skill_registry
+        self.tool_registry = tool_registry
 
     def assess(self, request: str) -> ComplexityScore:
         local = self._local_assess(request)
@@ -37,13 +42,19 @@ class Planner:
         write_verbs = ["implement", "add", "fix", "update", "refactor", "delete", "实现", "增加", "新增", "修复", "更新", "重构", "删除"]
         broad_words = ["architecture", "framework", "engine", "协同", "架构", "框架"]
         coupling_words = ["集成", "dashboard", "sqlite", "worker", "memory", "面板", "planner", "scheduler"]
+        scope_words = ["search", "scope", "find", "survey", "research", "investigate",
+                       "搜索", "查找", "调研", "调查", "查阅", "搜寻", "范围", "探索"]
         domain = 7 if any(k in text for k in broad_words) else 3
         ambiguity = 7 if any(k in text for k in ["重新梳理", "整个", "自主", "self", "evolution", "复杂"]) else 2
         coupling = 7 if any(k in text for k in coupling_words) else 2
         risk = 6 if any(k in text for k in ["数据库", "sqlite", "持久化", "监控", "并行"]) else 3
         if any(k in text for k in write_verbs):
             risk = max(risk, 5)
-        if len(words) <= 18 and steps <= 2 and not any(k in text for k in write_verbs + broad_words + coupling_words):
+        if any(k in text for k in scope_words):
+            domain = max(domain, 6)
+            ambiguity = max(ambiguity, 5)
+            risk = max(risk, 4)
+        if len(words) <= 18 and steps <= 2 and not any(k in text for k in write_verbs + broad_words + coupling_words + scope_words):
             domain = min(domain, 2)
             risk = min(risk, 2)
         complex_combo = (any(k in text for k in broad_words) or len(words) >= 4) and any(k in text for k in coupling_words) and risk >= 6
@@ -218,10 +229,13 @@ No prose, no code fences outside the JSON, just the array.
                 node.checkpoint = True
         return nodes
 
-    def decompose(self, request: str, max_nodes: int = 8, capabilities: list[str] | None = None) -> Plan:
+    def decompose(self, request: str, max_nodes: int = 8, capabilities: list[str] | None = None,
+                  agent_backend: Any = None) -> Plan:
         lessons_block = self._load_recent_lessons()
         score = self._local_assess(request)
         if score.routing == "single":
+            return self.fallback_wbs(request, score=score)
+        if score.routing == "direct":
             return self.fallback_wbs(request, score=score)
         if capabilities:
             caps_list = ", ".join(capabilities)
@@ -349,12 +363,31 @@ No prose, no code fences outside the JSON, just the object.
                 write_targets=[],
             ),
         ]
+        # 纯搜索/调研类请求：只有分析节点（read-only），不追加实施节点
+        _is_search_only = not any(k in snippet.lower() for k in
+            ["implement", "add", "fix", "update", "refactor", "delete",
+             "实现", "增加", "新增", "修复", "更新", "重构", "删除"])
+        _has_search = any(k in snippet.lower() for k in
+            ["search", "scope", "find", "survey", "research", "investigate",
+             "搜索", "查找", "调研", "调查", "查阅", "搜寻", "范围", "探索"])
+        if _is_search_only and _has_search:
+            return Plan(
+                nodes=nodes,
+                shared_brief="Search/scope task — analysis only, no implementation needed.",
+            )
         if score.routing == "direct":
+            _design_keywords = ["design", "ui", "ux", "interface", "layout", "frontend",
+                                "component", "tailwind", "daisyui", "button", "card", "modal",
+                                "navbar", "login", "form", "landing", "dashboard",
+                                "设计", "界面", "布局", "美观", "样式", "漂亮", "好看",
+                                "登录", "注册", "导航", "卡片", "弹窗", "页面"]
+            _is_design = any(k in request.lower() for k in _design_keywords)
+            cap = "design" if _is_design else "general"
             nodes = [WBSNode(
                 "wbs-1",
                 "Direct execution",
                 request,
-                "general",
+                cap,
                 score.overall,
                 [],
                 True,

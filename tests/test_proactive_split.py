@@ -101,7 +101,11 @@ class ProactiveSplitTests(unittest.TestCase):
         self.assertIn("wbs-1-evidence-2", calls)
         parent = self.engine.store._one("SELECT status, result FROM wbs_nodes WHERE id='wbs-1'")
         self.assertEqual(parent["status"], "completed")
-        self.assertEqual(parent["result"], "Completed by proactive shards")
+        self.assertIn("Combined results from 4 shard(s)", parent["result"])
+        self.assertIn("[wbs-1-scope-1]", parent["result"])
+        self.assertIn("[wbs-1-evidence-2]", parent["result"])
+        self.assertIn("[wbs-1-impl-3]", parent["result"])
+        self.assertIn("[wbs-1-impl-4]", parent["result"])
         logs = self.engine.store._query("SELECT message FROM logs WHERE node_id='wbs-1' ORDER BY id")
         self.assertIn("node estimated to exceed timeout; splitting proactively", [row["message"] for row in logs])
 

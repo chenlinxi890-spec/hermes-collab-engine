@@ -46,6 +46,7 @@ class SkillEntry(RegistryEntry):
 
     content: str = ""
     file_path: str = ""  # disk path of the skill file
+    required_tools: list[str] = field(default_factory=list)  # tool profiles needed (used by SkillDistributor)
 
     @classmethod
     def from_legacy(cls, legacy) -> "SkillEntry":
@@ -60,6 +61,7 @@ class SkillEntry(RegistryEntry):
             priority=legacy.priority,
             content=legacy.content,
             file_path=getattr(legacy, "file_path", ""),
+            required_tools=list(getattr(legacy, "required_tools", [])),
         )
 
 
@@ -292,6 +294,128 @@ class UnifiedRegistry:
     def select_mcp(self, capability: str, *, max_entries: int = 4) -> list[MCPEntry]:
         """Select MCP entries for a capability."""
         return self.select_for_capability(capability, entry_type=MCPEntry, max_entries=max_entries)
+
+    # -- MCP server management -----------------------------------------------
+
+    DEFAULT_MCP_CAPABILITIES = ["*"]
+
+    def register_mcp_server(
+        self,
+        server_name: str,
+        command: str,
+        args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        tools: list[str] | None = None,
+        description: str = "",
+        display_name: str | None = None,
+        capabilities: list[str] | None = None,
+        source: str = "web-ui",
+    ) -> list[MCPEntry]:
+        """Register an MCP server and all its tools as individual MCPEntries.
+
+        Creates one MCPEntry per tool. If *tools* is empty/None, creates a
+        single entry representing the server itself so it appears in listings.
+
+        Returns the list of created entries.
+        """
+        if not server_name:
+            raise ValueError("server_name is required")
+        tools_list = tools or []
+        caps = capabilities or list(self.DEFAULT_MCP_CAPABILITIES)
+        display = display_name or f"MCP Server: {server_name}"
+        endpoint_parts = [command]
+        if args:
+            endpoint_parts.extend(args)
+        endpoint = " ".join(str(p) for p in endpoint_parts).strip()
+
+        created: list[MCPEntry] = []
+        # If no tools specified, create a single server-level entry
+        if not tools_list:
+            entry = MCPEntry(
+                name=f"mcp__{server_name}__server",
+                display_name=display,
+                category="mcp",
+                description=description or f"MCP server {server_name}",
+                capabilities=caps,
+                source=source,
+                priority=2,
+                server_name=server_name,
+                tool_name="server",
+                endpoint=endpoint,
+                allowed_tools=[f"mcp__{server_name}__server"],
+                config_path="",
+            )
+            self.register(entry)
+            created.append(entry)
+        else:
+            for tool_name in tools_list:
+                entry = MCPEntry(
+                    name=f"mcp__{server_name}__{tool_name}",
+                    display_name=f"{display}/{tool_name}",
+                    category="mcp",
+                    description=description or f"MCP tool {tool_name} from server {server_name}",
+                    capabilities=caps,
+                    source=source,
+                    priority=2,
+                    server_name=server_name,
+                    tool_name=tool_name,
+                    endpoint=endpoint,
+                    allowed_tools=[f"mcp__{server_name}__{tool_name}"],
+                    config_path="",
+                )
+                self.register(entry)
+                created.append(entry)
+        return created
+
+    def list_mcp_servers(self) -> list[dict]:
+        """List all MCP servers grouped by server name.
+
+        Returns a list of dicts, each representing an MCP server with its
+        tools listed under it.
+        """
+        mcp_entries = self.list_by_type(MCPEntry)
+        servers: dict[str, dict] = {}
+        for entry in mcp_entries:
+            srv_name = entry.server_name or "unknown"
+            if srv_name not in servers:
+                # Derive display_name from the first entry's display_name
+                first_display = entry.display_name
+                if entry.tool_name and f"/{entry.tool_name}" in first_display:
+                    first_display = first_display.rsplit("/", 1)[0].strip()
+                servers[srv_name] = {
+                    "server_name": srv_name,
+                    "display_name": first_display,
+                    "endpoint": entry.endpoint,
+                    "tools": [],
+                    "entry_count": 0,
+                    "source": entry.source,
+                }
+            servers[srv_name]["tools"].append({
+                "tool_name": entry.tool_name,
+                "qualified_name": entry.qualified_name,
+                "description": entry.description,
+                "capabilities": entry.capabilities,
+            })
+            servers[srv_name]["entry_count"] += 1
+            # Update endpoint if we find a non-empty one
+            if entry.endpoint:
+                servers[srv_name]["endpoint"] = entry.endpoint
+        return sorted(servers.values(), key=lambda s: s["server_name"])
+
+    def remove_mcp_server(self, server_name: str) -> int:
+        """Remove all MCP entries for a given server name.
+
+        Returns the number of entries removed.
+        """
+        to_remove = [
+            e.name for e in self._entries.values()
+            if isinstance(e, MCPEntry) and e.server_name == server_name
+        ]
+        if not to_remove:
+            return 0
+        for name in to_remove:
+            self.delete(name)
+        return len(to_remove)
 
     def allowed_tools_for_capability(self, capability: str) -> list[str]:
         """Merge allowed_tools from all tool and MCP entries for a capability."""

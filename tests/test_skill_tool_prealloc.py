@@ -2,8 +2,8 @@
 
 Verifies that:
 1. Pre-allocation fills node.skills_json and node.tools_json before workers start.
-2. _run_worker uses pre-allocated values instead of re-selecting.
-3. Backward compatibility: empty skills_json falls back to per-worker selection.
+2. Pre-allocated values flow correctly into the SkillDistributor.
+3. Backward compatibility: empty skills_json falls back to capability defaults.
 """
 from __future__ import annotations
 
@@ -11,10 +11,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch, MagicMock
 
 from src.hermes_collab_engine.engine import CollabEngine
 from src.hermes_collab_engine.models import WBSNode
+from src.hermes_collab_engine.skill_distributor import SkillDistributor
+from src.hermes_collab_engine.skills import get_default_registry
+from src.hermes_collab_engine.tools import get_default_tool_registry
 
 
 class TestPreallocateSkillsTools(unittest.TestCase):
@@ -52,160 +54,99 @@ class TestPreallocateSkillsTools(unittest.TestCase):
         names = json.loads(node.tools_json)
         self.assertIn("file-edit", names)
 
+    def test_preallocate_respects_capability(self):
+        engine = self._make_engine()
+        node = self._make_node(capability="scope")
+        engine._preallocate_skills_tools("run_test", [node])
+        names = json.loads(node.skills_json)
+        self.assertIn("search-verify", names)
+
     def test_preallocate_persists_to_store(self):
         engine = self._make_engine()
         node = self._make_node()
-        # Insert the node into the store first
         engine.store.create_run("run_test", "title", "req", {}, agent="claude-code")
         engine.store.insert_wbs_node("run_test", node.to_dict())
         engine._preallocate_skills_tools("run_test", [node])
-        # Read back from store
         stored = engine.store.get_node("run_test", node.id)
         self.assertIsNotNone(stored)
         self.assertTrue(stored["skills_json"])
         self.assertTrue(stored["tools_json"])
 
+    def test_preallocate_leaves_leader_skills_intact(self):
+        engine = self._make_engine()
+        node = self._make_node()
+        node.skills_json = json.dumps(["test-verify"])
+        engine._preallocate_skills_tools("run_test", [node])
+        names = json.loads(node.skills_json)
+        self.assertIn("test-verify", names)  # Leader-assigned value preserved
 
-class TestWorkerUsesPreallocated(unittest.TestCase):
-    """Test that _run_worker uses pre-allocated values when available."""
+
+class TestWorkerUsesSkillDistributor(unittest.TestCase):
+    """Test that pre-allocated values flow correctly through SkillDistributor."""
+
+    def test_skill_distributor_reads_preallocated_skills(self):
+        sd = SkillDistributor(
+            skill_registry=get_default_registry(),
+            tool_registry=get_default_tool_registry(),
+        )
+        skills, tools = sd.resolve_for_node("implementation", ["implementation-focus"], None)
+        self.assertEqual(skills, ["implementation-focus"])
+        self.assertIn("file-edit", tools)
+
+    def test_skill_distributor_prompt_rendering(self):
+        sd = SkillDistributor(
+            skill_registry=get_default_registry(),
+            tool_registry=get_default_tool_registry(),
+        )
+        sb, tb, mb = sd.render_for_prompt(
+            ["implementation-focus"], ["file-edit", "git-local"], [],
+        )
+        self.assertIn("Focused Implementation", sb)
+        self.assertIn("File Read/Edit", tb)
+        self.assertIn("git-local", tb)
+
+
+class TestFallbackBehavior(unittest.TestCase):
+    """When skills_json is empty, SkillDistributor falls back to defaults."""
 
     def _make_engine(self):
         tmp = tempfile.mkdtemp()
         return CollabEngine(Path(tmp) / "db.sqlite3", tmp)
 
-    def _make_node(self, skills_json="", tools_json=""):
+    def _make_node(self, capability="implementation"):
         return WBSNode(
             id="wbs-test",
             title="Test task",
             description="Do something testable.",
-            capability="implementation",
+            capability=capability,
             complexity=5,
             dependencies=[],
             parallelizable=True,
             deliverable="Result",
-            skills_json=skills_json,
-            tools_json=tools_json,
         )
 
-    def test_worker_skips_skills_selection_when_preallocated(self):
+    def test_fallback_scope_uses_search_verify(self):
         engine = self._make_engine()
-        node = self._make_node(skills_json='["implementation-focus"]')
-        with patch.object(engine, '_skills_for_worker') as mock_skills:
-            # The worker should NOT call _skills_for_worker when skills_json is set
-            # We need to call _run_worker but it will fail because subprocess,
-            # so instead test the logic path by checking the skills_block construction
-            skills_block = engine._render_skills_from_names(json.loads(node.skills_json))
-            mock_skills.assert_not_called()
-            self.assertIn("implementation-focus", skills_block)
+        node = self._make_node(capability="scope")
+        engine._preallocate_skills_tools("run_test", [node])
+        names = json.loads(node.skills_json)
+        self.assertIn("search-verify", names)
 
-    def test_worker_skips_tools_selection_when_preallocated(self):
+    def test_fallback_verification_uses_test_verify(self):
         engine = self._make_engine()
-        node = self._make_node(tools_json='["file-edit"]')
-        with patch.object(engine, '_tools_for_worker') as mock_tools:
-            allowed, tools_block = engine._render_tools_from_names(json.loads(node.tools_json))
-            mock_tools.assert_not_called()
-            self.assertIn("file-edit", tools_block)
-            self.assertIn("Read", allowed)
+        node = self._make_node(capability="verification")
+        engine._preallocate_skills_tools("run_test", [node])
+        names = json.loads(node.skills_json)
+        self.assertIn("test-verify", names)
 
-    def test_render_skills_from_names_with_web_skill(self):
-        engine = self._make_engine()
-        from src.hermes_collab_engine.registry import (
-            SkillEntry as USkillEntry,
-            get_unified_registry,
-        )
-        unified = get_unified_registry()
-        web_skill = USkillEntry(
-            name="test-prealloc-skill",
-            display_name="Test Prealloc Skill",
-            category="custom",
-            description="A skill for testing pre-alloc",
-            capabilities=["implementation"],
-            source="web-ui",
-            priority=2,
-            content="Custom pre-alloc instructions.",
-        )
-        unified.register(web_skill)
-        try:
-            block = engine._render_skills_from_names(["test-prealloc-skill"])
-            self.assertIn("test-prealloc-skill", block)
-            self.assertIn("Custom pre-alloc instructions.", block)
-        finally:
-            unified.delete("test-prealloc-skill")
-
-    def test_render_tools_from_names_with_web_tool(self):
-        engine = self._make_engine()
-        from src.hermes_collab_engine.registry import (
-            ToolEntry as UToolEntry,
-            get_unified_registry,
-        )
-        unified = get_unified_registry()
-        web_tool = UToolEntry(
-            name="test-prealloc-tool",
-            display_name="Test Prealloc Tool",
-            category="custom",
-            description="A tool for testing pre-alloc",
-            capabilities=["implementation"],
-            source="web-ui",
-            priority=2,
-            allowed_tools=["CustomPreallocTool"],
-        )
-        unified.register(web_tool)
-        try:
-            allowed, block = engine._render_tools_from_names(["test-prealloc-tool"])
-            self.assertIn("test-prealloc-tool", block)
-            self.assertIn("CustomPreallocTool", allowed)
-        finally:
-            unified.delete("test-prealloc-tool")
-
-
-class TestBackwardCompatFallback(unittest.TestCase):
-    """Test backward compatibility when skills_json/tools_json are empty."""
-
-    def _make_engine(self):
-        tmp = tempfile.mkdtemp()
-        return CollabEngine(Path(tmp) / "db.sqlite3", tmp)
-
-    def _make_node(self):
-        return WBSNode(
-            id="wbs-test",
-            title="Test task",
-            description="Do something testable.",
-            capability="implementation",
-            complexity=5,
-            dependencies=[],
-            parallelizable=True,
-            deliverable="Result",
-            skills_json="",
-            tools_json="",
-        )
-
-    def test_fallback_calls_skills_for_worker(self):
+    def test_fallback_with_leader_skills(self):
+        """Leader-assigned skills_json takes priority over fallback."""
         engine = self._make_engine()
         node = self._make_node()
-        self.assertEqual(node.skills_json, "")
-        # When skills_json is empty, _skills_for_worker should be called
-        skill_names, skills_block = engine._skills_for_worker(node)
-        self.assertIn("implementation-focus", skill_names)
-        self.assertIn("Relevant skills injected by Hermes:", skills_block)
-
-    def test_fallback_calls_tools_for_worker(self):
-        engine = self._make_engine()
-        node = self._make_node()
-        self.assertEqual(node.tools_json, "")
-        # When tools_json is empty, _tools_for_worker should be called
-        tool_names, allowed, tools_block = engine._tools_for_worker(node)
-        self.assertIn("file-edit", tool_names)
-        self.assertIn("Read", allowed)
-
-    def test_preallocate_failure_leaves_json_empty(self):
-        """If pre-allocation throws, node JSON stays empty — worker falls back."""
-        engine = self._make_engine()
-        node = self._make_node()
-        with patch.object(engine, '_skills_for_worker', side_effect=Exception("boom")):
-            engine._preallocate_skills_tools("run_test", [node])
-        # skills_json should remain empty on failure
-        self.assertEqual(node.skills_json, "")
-        self.assertEqual(node.tools_json, "")
+        node.skills_json = json.dumps(["risk-checkpoint"])
+        engine._preallocate_skills_tools("run_test", [node])
+        names = json.loads(node.skills_json)
+        self.assertIn("risk-checkpoint", names)
 
 
 if __name__ == "__main__":

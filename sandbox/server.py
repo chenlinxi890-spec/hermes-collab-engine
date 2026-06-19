@@ -717,6 +717,10 @@ class SandboxHandler(BaseHTTPRequestHandler):
             self._json(tools_payload(node_type, task))
         elif path == "/api/session-chains":
             self._json([])
+        elif path == "/api/mcp-servers":
+            from hermes_collab_engine.registry import get_unified_registry
+            registry = get_unified_registry()
+            self._json({"servers": registry.list_mcp_servers()})
         elif path == "/api/registry":
             from hermes_collab_engine.registry import get_unified_registry
             registry = get_unified_registry()
@@ -798,6 +802,66 @@ class SandboxHandler(BaseHTTPRequestHandler):
                 return self._json({"error": f"unknown type: {entry_type}"}, 400)
             registry.register(entry)
             return self._json({"ok": True, "name": name, "type": entry_type})
+        elif path == "/api/mcp-servers":
+            import re
+            from hermes_collab_engine.registry import get_unified_registry
+            registry = get_unified_registry()
+            server_name = str(data.get("server_name", "")).strip()
+            if not server_name or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", server_name):
+                return self._json({"error": "server_name is required, must match [a-zA-Z0-9_-]{1,64}"}, 400)
+            command = str(data.get("command", "")).strip()
+            if not command:
+                return self._json({"error": "command is required"}, 400)
+            args = data.get("args", [])
+            if not isinstance(args, list):
+                args = [str(a) for a in args] if args else []
+            env = data.get("env", {})
+            if not isinstance(env, dict):
+                env = {}
+            tools = data.get("tools", [])
+            if not isinstance(tools, list):
+                tools = []
+            description = str(data.get("description", "")).strip()
+            display_name = str(data.get("display_name", server_name)).strip()
+            capabilities = data.get("capabilities", ["*"])
+            if not isinstance(capabilities, list):
+                capabilities = ["*"]
+            existing = registry.list_mcp_servers()
+            if any(s["server_name"] == server_name for s in existing):
+                return self._json({"error": f"MCP server {server_name!r} already exists"}, 409)
+            created = registry.register_mcp_server(
+                server_name=server_name,
+                command=command,
+                args=args,
+                env=env,
+                tools=tools,
+                description=description,
+                display_name=display_name,
+                capabilities=capabilities,
+                source="sandbox-web-ui",
+            )
+            return self._json({
+                "ok": True,
+                "server_name": server_name,
+                "entries_created": len(created),
+                "tools": tools,
+            })
+        self._json({"error": "not found"}, 404)
+
+    def do_DELETE(self) -> None:
+        raw_path = urlparse(self.path).path
+        path = self._path_under_base(raw_path)
+        if path is None:
+            return self._json({"error": "not found", "sandbox_base_path": self.server.sandbox_base_path}, 404)
+        if path.startswith("/api/mcp-servers/"):
+            server_name = path.split("/")[-1]
+            from hermes_collab_engine.registry import get_unified_registry
+            reg = get_unified_registry()
+            removed = reg.remove_mcp_server(server_name)
+            if removed > 0:
+                return self._json({"ok": True, "server_name": server_name, "entries_removed": removed})
+            else:
+                return self._json({"error": f"MCP server {server_name!r} not found"}, 404)
         self._json({"error": "not found"}, 404)
 
     def log_message(self, fmt, *args) -> None:

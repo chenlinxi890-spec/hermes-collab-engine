@@ -112,6 +112,10 @@ class DashboardServer:
                     run_id = (query.get("run_id") or [None])[0]
                     context = outer.store.session_resume_context(run_id)
                     self._json(context or {"error": "no previous run"}, 200 if context else 404)
+                elif path == "/api/mcp-servers":
+                    from .registry import get_unified_registry
+                    registry = get_unified_registry()
+                    self._json({"servers": registry.list_mcp_servers()})
                 elif path == "/api/registry":
                     from .registry import get_unified_registry
                     registry = get_unified_registry()
@@ -156,6 +160,36 @@ class DashboardServer:
                     request = str(data.get("request") or "").strip()
                     if not request:
                         return self._json({"error": "request is required"}, 400)
+                    # Mode-5 bug fix 2026-06-17: reject obviously-fabricated
+                    # briefs. These patterns bit us hard on 2026-06-16: a
+                    # brief like "端到端验证任务(用 leader 分配 worker 真测)"
+                    # has no real deliverable — the agent ran it anyway,
+                    # produced a failed run, and burned tokens. The
+                    # distill README's "fabricate trap" (verify-claims-
+                    # against-evidence Pitfall 20) says: if the brief
+                    # can't name the specific files or verification step,
+                    # it's a fabrication. The short-circuit below is the
+                    # cheap gate; the long gate is the planner rejecting
+                    # a plan with no real targets.
+                    fabricate_markers = (
+                        "端到端验证任务(用 leader 分配 worker 真测)",
+                        "e2e_verify", "e2e-verify",
+                        "smoke test", "smoke-test", "smoke_test",
+                        "fake task", "fake-task",
+                        "测试任务", "试一下", "试试看",
+                        "看看能不能",
+                    )
+                    if any(m in request.lower() for m in fabricate_markers):
+                        return self._json({
+                            "error": "fabricated brief rejected",
+                            "detail": ("Brief matches a known fabrication marker. "
+                                       "Please describe the specific files to change, "
+                                       "the verification command, and the expected "
+                                       "deliverable. See distill README 'fabricate "
+                                       "trap' and verify-claims-against-evidence "
+                                       "Pitfall 20."),
+                            "matched_marker": [m for m in fabricate_markers if m in request.lower()],
+                        }, 400)
                     title = data.get("title")
                     resume_context = None
                     if data.get("resume"):
@@ -252,6 +286,51 @@ class DashboardServer:
                     )
                     register_backend(backend)
                     self._json({"ok": True, "name": name})
+                elif path == "/api/mcp-servers":
+                    import re
+                    from .registry import get_unified_registry
+                    registry = get_unified_registry()
+                    server_name = str(data.get("server_name", "")).strip()
+                    if not server_name or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", server_name):
+                        return self._json({"error": "server_name 必填，只允许 [a-zA-Z0-9_-]，长度 1-64"}, 400)
+                    command = str(data.get("command", "")).strip()
+                    if not command:
+                        return self._json({"error": "command 必填"}, 400)
+                    args = data.get("args", [])
+                    if not isinstance(args, list):
+                        args = [str(a) for a in args] if args else []
+                    env = data.get("env", {})
+                    if not isinstance(env, dict):
+                        env = {}
+                    tools = data.get("tools", [])
+                    if not isinstance(tools, list):
+                        tools = []
+                    description = str(data.get("description", "")).strip()
+                    display_name = str(data.get("display_name", server_name)).strip()
+                    capabilities = data.get("capabilities", ["*"])
+                    if not isinstance(capabilities, list):
+                        capabilities = ["*"]
+                    # Check for duplicate server name
+                    existing = registry.list_mcp_servers()
+                    if any(s["server_name"] == server_name for s in existing):
+                        return self._json({"error": f"MCP server {server_name!r} already exists"}, 409)
+                    created = registry.register_mcp_server(
+                        server_name=server_name,
+                        command=command,
+                        args=args,
+                        env=env,
+                        tools=tools,
+                        description=description,
+                        display_name=display_name,
+                        capabilities=capabilities,
+                        source="web-ui",
+                    )
+                    self._json({
+                        "ok": True,
+                        "server_name": server_name,
+                        "entries_created": len(created),
+                        "tools": tools,
+                    })
                 elif path == "/api/registry":
                     entry_type = data.get("type", "skill")
                     name = str(data.get("name", "")).strip()
@@ -314,7 +393,16 @@ class DashboardServer:
 
             def do_DELETE(self):
                 path = urlparse(self.path).path
-                if path.startswith("/api/registry/"):
+                if path.startswith("/api/mcp-servers/"):
+                    server_name = path.split("/")[-1]
+                    from .registry import get_unified_registry
+                    reg = get_unified_registry()
+                    removed = reg.remove_mcp_server(server_name)
+                    if removed > 0:
+                        self._json({"ok": True, "server_name": server_name, "entries_removed": removed})
+                    else:
+                        self._json({"error": f"MCP server {server_name!r} not found"}, 404)
+                elif path.startswith("/api/registry/"):
                     name = path.split("/")[-1]
                     from .registry import get_unified_registry
                     reg = get_unified_registry()

@@ -1860,7 +1860,19 @@ Output contract:
         node = WBSNode(f"{run_id}-aggregate", "Aggregate results", "Aggregate worker outputs into final answer", "aggregation", 5, [], False, "Final answer")
         self.store.insert_wbs_node(run_id, node.to_dict())
         self.store.update_node(node.id, "running", run_id=run_id)
-        report = json.dumps([r.to_dict() for r in results], ensure_ascii=False, indent=2)
+        # 2026-06-19 fix: strip large result bodies to prevent prompt exceeding
+        # ARG_MAX (~2MB). Worker result.result can contain entire file contents
+        # (e.g. a 1900-line HTML file). Pass only summary/metadata to the
+        # aggregator — the full content is in the DB and is not needed for the
+        # final report because the aggregator just produces a summary.
+        _AGGREGATE_RESULT_MAX_CHARS = 2000  # truncate individual results to this
+        trimmed = []
+        for r in results:
+            d = r.to_dict()
+            if d.get("result") and len(d["result"]) > _AGGREGATE_RESULT_MAX_CHARS:
+                d["result"] = d["result"][:_AGGREGATE_RESULT_MAX_CHARS] + f"\n... [truncated {len(d['result'])} chars for aggregation]"
+            trimmed.append(d)
+        report = json.dumps(trimmed, ensure_ascii=False, indent=2)
         # Surface the Leader-selected package + Skill collection so the
         # aggregator has the full context when writing the final report.
         meta = {}

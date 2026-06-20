@@ -312,6 +312,7 @@ class CollabEngine:
             split_children: dict[str, set[str]] = {}
             split_finished: dict[str, set[str]] = {}
             split_results: dict[str, list[WorkerResult]] = {}
+            deferred_queue: list[str] = []  # nodes killed by watchdog, waiting for resources
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
                 running: dict[concurrent.futures.Future[list[WorkerResult]], WBSNode] = {}
@@ -426,6 +427,7 @@ class CollabEngine:
                                 node.id)
                             # If this skipped node is a proactive shard, record it
                             # in split_finished so the parent gets reconciled.
+                            pending.pop(node.id, None)
                             _parent_of_skipped = node.parent_id if node.parent_id in split_children else None
                             if _parent_of_skipped:
                                 split_finished[_parent_of_skipped].add(node.id)
@@ -470,8 +472,41 @@ class CollabEngine:
 
                     if not running:
                         if self._checkpoint_paused_nodes:
-                            # Checkpoint paused, no workers running — stop scheduling
                             break
+                        # Deferred recovery: if resources available, re-dispatch killed nodes
+                        if deferred_queue:
+                            cpu_now = self._get_cpu_percent() or 0
+                            mem_now = self._get_mem_percent() or 0
+                            if cpu_now < 70 and mem_now < 70:
+                                deferred_queue.sort(key=lambda nid: self.store._one("SELECT created_at FROM wbs_nodes WHERE id=?", (nid,))["created_at"] if self.store._one("SELECT created_at FROM wbs_nodes WHERE id=?", (nid,)) else "")
+                                for nid in list(deferred_queue):
+                                    if len(running) >= max_workers:
+                                        break
+                                    node_obj = pending.get(nid)
+                                    if not node_obj:
+                                        node_obj = self.store._one("SELECT * FROM wbs_nodes WHERE id=? AND run_id=?", (nid, run_id))
+                                        if node_obj:
+                                            import json as _json
+                                            deps = _json.loads(node_obj.get("dependencies_json", "[]"))
+                                            node_obj2 = WBSNode(nid, node_obj["title"], node_obj["description"],
+                                                node_obj["capability"], node_obj["complexity"], deps,
+                                                node_obj.get("parallelizable", 1), node_obj["deliverable"])
+                                            pending[nid] = node_obj2
+                                    if nid in pending:
+                                        deferred_queue.remove(nid)
+                            elif any(nid not in deferred_queue for nid in deferred_queue):
+                                _now2 = time.time()
+                                for nid in list(deferred_queue):
+                                    row = self.store._one("SELECT created_at FROM wbs_nodes WHERE id=?", (nid,))
+                                    if row:
+                                        try:
+                                            from datetime import datetime as _dt
+                                            created = _dt.strptime(row["created_at"], "%Y-%m-%d %H:%M:%S")
+                                            if (_now2 - created.timestamp()) > 600:
+                                                self.store.update_node(nid, "failed", "deferred timeout: resources not available", None, None, None, run_id=run_id)
+                                                deferred_queue.remove(nid)
+                                        except Exception:
+                                            pass
                         continue
 
                     done, _ = concurrent.futures.wait(running.keys(), timeout=_STALL_CHECK_INTERVAL, return_when=concurrent.futures.FIRST_COMPLETED)
@@ -486,7 +521,12 @@ class CollabEngine:
                             with self._worker_procs_lock:
                                 proc = self._worker_procs.get(oldest_node.id)
                                 if proc:
-                                    proc.kill()
+                                    import os, signal
+                                    try:
+                                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                                    except (ProcessLookupError, PermissionError):
+                                        proc.kill()
+                            deferred_queue.append(oldest_node.id)
                             self._resource_timeout_nodes.add(oldest_node.id)
                             self.store.log(run_id, "warning",
                                 "worker killed by resource-pressure watchdog",
@@ -742,17 +782,19 @@ class CollabEngine:
         except (TypeError, ValueError):
             return False
 
-        # 1. Base shard count by task size
+        # 1. Base shard count by task size + min granularity
+        # Each shard must produce at least MIN_SHARD_WORK seconds of work.
+        _MIN_SHARD_WORK = 180  # 3 min per shard minimum
+        if est <= _MIN_SHARD_WORK:
+            return False
         if est > 1200:
-            target = 8
-        elif est > 600:
-            target = 6
-        elif est > 300:
             target = 4
-        elif est > 120:
+        elif est > 600:
+            target = 3
+        elif est > 300:
             target = 2
         else:
-            return False  # < 2 min, no split
+            return False  # < 5 min, no split (already handled above)
 
         # 2. Load factor: system busy → fewer shards
         cpu = self._get_cpu_percent() or 0
@@ -768,8 +810,8 @@ class CollabEngine:
         import math
         target = max(2, int(math.ceil(target * factor)))
 
-        # 3. WBS min granularity: each shard >= 2 min of work
-        target = min(target, max(2, est // 120))
+        # 3. WBS min granularity: each shard >= MIN_SHARD_WORK sec of work
+        target = min(target, max(1, est // _MIN_SHARD_WORK))
 
         # 4. Available concurrency slots
         running_count = len(self._worker_procs)
@@ -1755,15 +1797,20 @@ Output contract:
 - Use this JSON shape: {{"status":"ok|blocked|failed","summary":"short result summary","files_modified":["path"],"verification":["command or check"],"notes":["optional note"]}}
 {backend.prompt_suffix}"""
         # 2026-06-20 fix: hard cap prompt size to prevent ARG_MAX overflow.
-        _PROMPT_SAFE_MAX_BYTES = 900_000
+        # Truncate by BYTES (not chars) because CJK UTF-8 is 3 bytes/char.
+        _PROMPT_SAFE_MAX_BYTES = 500_000  # 500 KB, well under 2 MB ARG_MAX
         _prompt_bytes = prompt.encode("utf-8", errors="replace")
-        if len(_prompt_bytes) > _PROMPT_SAFE_MAX_BYTES:
+        _pb_len = len(_prompt_bytes)
+        if _pb_len > _PROMPT_SAFE_MAX_BYTES:
             _half = _PROMPT_SAFE_MAX_BYTES // 2
-            _hl = len(_prompt_bytes)
-            _msg = "\n\n...[PROMPT TRUNCATED: " + str(_hl) + " bytes > " + str(_PROMPT_SAFE_MAX_BYTES) + " limit]...\n\n"
-            prompt = prompt[:_half] + _msg + prompt[-_half:]
+            _msg = "\n\n...[PROMPT TRUNCATED: " + str(_pb_len) + " bytes > " + str(_PROMPT_SAFE_MAX_BYTES) + " limit]...\n\n"
+            _msg_b = _msg.encode("utf-8")
+            # Take first half bytes and last half bytes, decode back safely
+            prompt = _prompt_bytes[:_half].decode("utf-8", errors="ignore") \
+                   + _msg \
+                   + _prompt_bytes[-_half:].decode("utf-8", errors="ignore")
             self.store.log(run_id, "warning", "prompt truncated for ARG_MAX",
-                {"node": node.id, "original_bytes": _hl,
+                {"node": node.id, "original_bytes": _pb_len,
                  "truncated_to": _PROMPT_SAFE_MAX_BYTES}, node.id)
         selected_model = model_override or self.worker_model
         # If prompt is too long for command-line args, use stdin via temp file.

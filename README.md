@@ -1,6 +1,6 @@
 # Hermes Collab Engine v5.6 — Multi-Agent AI Collaboration Engine
 
-[![English](https://img.shields.io/badge/English-README.en.md-blue)](README.en.md) [![Release v5.6.0](https://img.shields.io/badge/release-v5.6.0-blue)](CHANGELOG.md) [![Sandbox ready](https://img.shields.io/badge/sandbox-ready-success)](sandbox/README.md) [![License MIT](https://img.shields.io/badge/license-MIT-green)](#许可证) [![Security](https://img.shields.io/badge/security-policy-orange)](SECURITY.md)
+[![English](https://img.shields.io/badge/English-README.en.md-blue)](README.en.md) [![Release v5.6.1](https://img.shields.io/badge/release-v5.6.1-blue)](CHANGELOG.md) [![Sandbox ready](https://img.shields.io/badge/sandbox-ready-success)](sandbox/README.md) [![License MIT](https://img.shields.io/badge/license-MIT-green)](#许可证) [![Security](https://img.shields.io/badge/security-policy-orange)](SECURITY.md)
 
 > Open-source multi-agent orchestration for Claude Code, Hermes, Codex, OpenCode, OpenClaw & custom AI agents — plan, split, dispatch, supervise, aggregate.
 

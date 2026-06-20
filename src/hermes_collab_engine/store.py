@@ -10,16 +10,16 @@ from .models import RiskPolicy
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
-CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY,title TEXT NOT NULL,request TEXT NOT NULL,status TEXT NOT NULL,complexity_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,completed_at TEXT);
-CREATE TABLE IF NOT EXISTS wbs_nodes (id TEXT NOT NULL,run_id TEXT NOT NULL,parent_id TEXT,title TEXT NOT NULL,description TEXT NOT NULL,capability TEXT NOT NULL,complexity INTEGER NOT NULL,dependencies_json TEXT NOT NULL DEFAULT '[]',parallelizable INTEGER NOT NULL DEFAULT 1,deliverable TEXT NOT NULL,status TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,checkpoint INTEGER NOT NULL DEFAULT 0,result TEXT,session_id TEXT,duration_seconds REAL,error TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,brief TEXT DEFAULT '',shared_brief TEXT DEFAULT '',estimated_duration INTEGER DEFAULT NULL,write_targets_json TEXT DEFAULT '[]',result_struct_json TEXT DEFAULT NULL,skills_json TEXT DEFAULT NULL,tools_json TEXT DEFAULT NULL,fingerprint TEXT DEFAULT '',PRIMARY KEY (id, run_id),FOREIGN KEY(run_id) REFERENCES runs(id));
-CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY,run_id TEXT NOT NULL,node_id TEXT,status TEXT NOT NULL,started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,duration_seconds REAL,session_id TEXT,error TEXT);
-CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT,node_id TEXT,level TEXT NOT NULL,message TEXT NOT NULL,data_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS lessons (id INTEGER PRIMARY KEY AUTOINCREMENT,scope TEXT NOT NULL DEFAULT 'global',category TEXT NOT NULL,lesson TEXT NOT NULL,evidence_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS metrics (key TEXT PRIMARY KEY,value_json TEXT NOT NULL,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value_json TEXT NOT NULL,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS node_results (node_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,result_text TEXT DEFAULT '',result_struct_json TEXT DEFAULT NULL,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS run_state (run_id TEXT PRIMARY KEY,paused INTEGER DEFAULT 0,checkpoint_paused_nodes_json TEXT DEFAULT '[]',updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
-CREATE TABLE IF NOT EXISTS context_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT NOT NULL,snapshot_type TEXT NOT NULL,node_id TEXT DEFAULT NULL,snapshot_json TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY,title TEXT NOT NULL,request TEXT NOT NULL,status TEXT NOT NULL,complexity_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),completed_at TEXT);
+CREATE TABLE IF NOT EXISTS wbs_nodes (id TEXT NOT NULL,run_id TEXT NOT NULL,parent_id TEXT,title TEXT NOT NULL,description TEXT NOT NULL,capability TEXT NOT NULL,complexity INTEGER NOT NULL,dependencies_json TEXT NOT NULL DEFAULT '[]',parallelizable INTEGER NOT NULL DEFAULT 1,deliverable TEXT NOT NULL,status TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,checkpoint INTEGER NOT NULL DEFAULT 0,result TEXT,session_id TEXT,duration_seconds REAL,error TEXT,created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),brief TEXT DEFAULT '',shared_brief TEXT DEFAULT '',estimated_duration INTEGER DEFAULT NULL,write_targets_json TEXT DEFAULT '[]',result_struct_json TEXT DEFAULT NULL,skills_json TEXT DEFAULT NULL,tools_json TEXT DEFAULT NULL,fingerprint TEXT DEFAULT '',PRIMARY KEY (id, run_id),FOREIGN KEY(run_id) REFERENCES runs(id));
+CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY,run_id TEXT NOT NULL,node_id TEXT,status TEXT NOT NULL,started_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),duration_seconds REAL,session_id TEXT,error TEXT);
+CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT,node_id TEXT,level TEXT NOT NULL,message TEXT NOT NULL,data_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')));
+CREATE TABLE IF NOT EXISTS lessons (id INTEGER PRIMARY KEY AUTOINCREMENT,scope TEXT NOT NULL DEFAULT 'global',category TEXT NOT NULL,lesson TEXT NOT NULL,evidence_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')));
+CREATE TABLE IF NOT EXISTS metrics (key TEXT PRIMARY KEY,value_json TEXT NOT NULL,updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')));
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value_json TEXT NOT NULL,updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')));
+CREATE TABLE IF NOT EXISTS node_results (node_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,result_text TEXT DEFAULT '',result_struct_json TEXT DEFAULT NULL,updated_at TEXT DEFAULT (datetime('now','localtime')));
+CREATE TABLE IF NOT EXISTS run_state (run_id TEXT PRIMARY KEY,paused INTEGER DEFAULT 0,checkpoint_paused_nodes_json TEXT DEFAULT '[]',updated_at TEXT DEFAULT (datetime('now','localtime')));
+CREATE TABLE IF NOT EXISTS context_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT NOT NULL,snapshot_type TEXT NOT NULL,node_id TEXT DEFAULT NULL,snapshot_json TEXT NOT NULL,created_at TEXT DEFAULT (datetime('now','localtime')));
 """
 
 
@@ -30,28 +30,14 @@ class CollabStore:
         self.lock = threading.RLock()
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        # 2026-06-17 fix (stale-cleanup): the previous default of
-        # `synchronous=NORMAL` (which is the SQLite WAL default) lets
-        # `commit()` return as soon as the write hits the OS page cache,
-        # without an fsync. A SIGKILL on the parent CLI between the
-        # `update_run` call and the WAL checkpoint at exit could leave
-        # `runs.status='failed'` and `runs.completed_at` durable on
-        # disk while the corresponding `wbs_nodes` UPDATEs were still
-        # sitting in the WAL — and on next process startup the WAL
-        # could be checkpointed to a state where the run row is
-        # terminal but the child wbs rows are still 'running'/'pending',
-        # which is exactly the 5-row ghost-cleanup scenario the
-        # operator hit on 2026-06-17. Pinning `synchronous=FULL`
-        # forces every commit to wait for the fsync of the WAL frame
-        # to durable storage. On the production 4 GB / SSD host this
-        # adds ~1-3 ms per commit; the cost is negligible compared to
-        # a 22-hour stale-dashboard bug.
+        # Pinning synchronous=FULL forces every commit to wait for the fsync
+        # of the WAL frame to durable storage. On production SSD hosts this
+        # adds ~1-3 ms per commit; the cost is negligible compared to data loss.
         self.conn.execute("PRAGMA synchronous=FULL")
         # Record engine start timestamp so _cleanup_stale_workers can
         # distinguish "this incarnation's runs" from "previous incarnation's runs".
         # CRITICAL: format MUST match SQLite CURRENT_TIMESTAMP ('YYYY-MM-DD HH:MM:SS')
-        # so string comparison is correct. Previous ISO format (with 'T' + 'Z')
-        # was lexicographically GREATER than space-separator SQLite timestamps.
+        # so string comparison is correct.
         import datetime
         now = datetime.datetime.utcnow()
         self._engine_start_ts = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -66,7 +52,7 @@ class CollabStore:
             self.conn.commit()
 
     def _ensure_schema(self) -> None:
-        # 2026-06-17 fix (Mode D) order matters:
+        # Order matters:
         # 1. Column migrations MUST run BEFORE the composite-PK migration,
         #    because the PK migration does a RENAME + CREATE + INSERT INTO
         #    ... SELECT *, and SELECT * will fail on columns that haven't
@@ -75,6 +61,7 @@ class CollabStore:
         self._migrate_wbs_checkpoint()
         self._migrate_wbs_context_fields()
         self._migrate_runs_agent()
+        self._migrate_runs_meta_json()
         # 2. Composite-PK migration last (it renames + recreates + drops)
         self._migrate_wbs_nodes_composite_pk()
         # 3. Stale-worker cleanup is safe to run after the schema is final
@@ -101,7 +88,7 @@ class CollabStore:
         )
         # Case 2: workers whose parent run is still 'running' — previous engine crashed.
         # These runs may have pending/running nodes that also need cleanup.
-        # CRITICAL: filter by created_at < engine start ts so we never touch
+        # Filter by created_at < engine start ts so we never touch
         # runs created by THIS incarnation (avoids race with newly spawned run CLIs).
         stale_run_ids = [
             row["id"] for row in self._query(
@@ -154,121 +141,6 @@ class CollabStore:
         if "scope" not in columns:
             self.conn.execute("ALTER TABLE lessons ADD COLUMN scope TEXT NOT NULL DEFAULT 'global'")
 
-    def _migrate_wbs_nodes_composite_pk(self) -> None:
-        """Migrate wbs_nodes to a composite PRIMARY KEY (id, run_id).
-
-        2026-06-17 fix (Mode D — `INSERT OR REPLACE` cross-run overwrite).
-
-        The original schema (engine.py:14 / SCHEMA) declared
-        `PRIMARY KEY (id, run_id)` so that the same node_id (e.g. `wbs-1`,
-        `wbs-2`, `wbs-2-scope-1`) can appear in **multiple runs** without
-        overwriting each other. But on a database that was created by a
-        pre-fix engine, the table has a single-column `id` PK — `CREATE
-        TABLE IF NOT EXISTS` skipped the PK definition because the table
-        already existed. Then `insert_wbs_node` (which uses
-        `INSERT OR REPLACE`) collides on the single `id` and **deletes the
-        old run's row**, rewriting the `run_id` to the new run.
-
-        Concrete impact: run_5e512066c21f (2026-06-17 01:07) wrote 4 wbs
-        nodes; the next run (run_f95a865d387a, 01:34) overwrote them all.
-        The dashboard showed "0 wbs_nodes for run_5e512066c21f" and
-        "this run never had any workers besides wbs-1 + 2 read-only
-        shards" — completely wrong. The actual run had 4 impl shards
-        scheduled; they failed in a separate bug (Mode C write_targets
-        deadlock) but the *evidence* of those 4 nodes was wiped by
-        Mode D.
-
-        Migration strategy: PRAGMA table_info to detect the single-PK
-        case, then rename + recreate + copy + drop. SQLite's
-        `INSERT OR REPLACE` is `ON CONFLICT(<pk>) DO REPLACE`, so once
-        the table has the composite PK, the engine's existing
-        `INSERT OR REPLACE` becomes safe (col 6 of the table_info
-        result for `id` will be 1 only if it's a single-column PK).
-        """
-        # Detect current PK shape on the wbs_nodes table. SQLite uses
-        # pk flag 1, 2, 3, ... to order composite-PK columns; we need
-        # all flags > 0, not just == 1.
-        rows = self.conn.execute("PRAGMA table_info(wbs_nodes)").fetchall()
-        if not rows:
-            return  # table doesn't exist yet — SCHEMA created it correctly
-        pk_cols = [r[1] for r in rows if r[5] > 0]  # r[5] = pk flag (>=1)
-        if set(pk_cols) == {"id", "run_id"}:
-            return  # already composite — no migration needed
-        # Single-id PK detected. Rebuild with composite PK. WAL is on
-        # so the rename + recreate + copy are atomic from the engine's
-        # perspective (single connection, single transaction).
-        with self.lock:
-            self.conn.execute("ALTER TABLE wbs_nodes RENAME TO wbs_nodes__old")
-            # Re-emit the canonical SCHEMA's CREATE TABLE for wbs_nodes.
-            # We keep the same column set the SCHEMA declared so the
-            # `INSERT INTO ... SELECT * FROM` copy below is a 1:1 row map.
-            self.conn.execute("""
-                CREATE TABLE wbs_nodes (
-                    id TEXT NOT NULL,
-                    run_id TEXT NOT NULL,
-                    parent_id TEXT,
-                    title TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    capability TEXT NOT NULL,
-                    complexity INTEGER NOT NULL,
-                    dependencies_json TEXT NOT NULL DEFAULT '[]',
-                    parallelizable INTEGER NOT NULL DEFAULT 1,
-                    deliverable TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    attempt INTEGER NOT NULL DEFAULT 1,
-                    checkpoint INTEGER NOT NULL DEFAULT 0,
-                    result TEXT,
-                    session_id TEXT,
-                    duration_seconds REAL,
-                    error TEXT,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    brief TEXT DEFAULT '',
-                    shared_brief TEXT DEFAULT '',
-                    estimated_duration INTEGER DEFAULT NULL,
-                    write_targets_json TEXT DEFAULT '[]',
-                    result_struct_json TEXT DEFAULT NULL,
-                    skills_json TEXT DEFAULT NULL,
-                    tools_json TEXT DEFAULT NULL,
-                    fingerprint TEXT DEFAULT '',
-                    PRIMARY KEY (id, run_id),
-                    FOREIGN KEY(run_id) REFERENCES runs(id)
-                )
-            """)
-            # Copy every row from the old table. Composite PK means
-            # duplicates (same id, different run_id) now coexist; if the
-            # old DB had `INSERT OR REPLACE`-induced collisions, the old
-            # table only has the LAST run's row for each (id), so we
-            # can't recover the lost ones — but from this point on no
-            # more collisions are possible. Use COALESCE for columns
-            # that might have been added by a later migration (e.g.
-            # checkpoint, brief, shared_brief) so the SELECT is robust
-            # against pre-migration tables.
-            self.conn.execute("""
-                INSERT INTO wbs_nodes
-                  (id, run_id, parent_id, title, description, capability,
-                   complexity, dependencies_json, parallelizable, deliverable,
-                   status, attempt, checkpoint, result, session_id,
-                   duration_seconds, error, created_at, updated_at,
-                   brief, shared_brief, estimated_duration, write_targets_json,
-                   result_struct_json, skills_json, tools_json, fingerprint)
-                SELECT id, run_id, parent_id, title, description, capability,
-                   complexity, dependencies_json, parallelizable, deliverable,
-                   status, attempt,
-                   COALESCE(checkpoint, 0),
-                   result, session_id, duration_seconds, error, created_at, updated_at,
-                   COALESCE(brief, ''), COALESCE(shared_brief, ''),
-                   COALESCE(estimated_duration, NULL),
-                   COALESCE(write_targets_json, '[]'),
-                   COALESCE(result_struct_json, NULL),
-                   COALESCE(skills_json, NULL),
-                   COALESCE(tools_json, NULL),
-                   COALESCE(fingerprint, '')
-                FROM wbs_nodes__old
-            """)
-            self.conn.execute("DROP TABLE wbs_nodes__old")
-            self.conn.commit()
-
     def _migrate_wbs_checkpoint(self) -> None:
         columns = {row[1] for row in self.conn.execute("PRAGMA table_info(wbs_nodes)").fetchall()}
         if "checkpoint" not in columns:
@@ -296,17 +168,103 @@ class CollabStore:
         if "agent" not in columns:
             self.conn.execute("ALTER TABLE runs ADD COLUMN agent TEXT DEFAULT 'claude-code'")
 
+    def _migrate_runs_meta_json(self) -> None:
+        """Add runs.meta_json so callers can store per-run metadata such as
+        the selected package and its skill collection without redefining the
+        runs table schema.
+        """
+        columns = {row[1] for row in self.conn.execute("PRAGMA table_info(runs)").fetchall()}
+        if "meta_json" not in columns:
+            self.conn.execute("ALTER TABLE runs ADD COLUMN meta_json TEXT NOT NULL DEFAULT '{}'")
+
+    def _migrate_wbs_nodes_composite_pk(self) -> None:
+        """Migrate wbs_nodes to a composite PRIMARY KEY (id, run_id).
+
+        The original schema declared PRIMARY KEY (id) so that the same
+        node_id (e.g. 'wbs-1', 'wbs-2') from **different runs** would
+        collide via INSERT OR REPLACE, deleting old run's data. The fix
+        changes the PK to (id, run_id) so cross-run node IDs coexist.
+        """
+        rows = self.conn.execute("PRAGMA table_info(wbs_nodes)").fetchall()
+        if not rows:
+            return
+        pk_cols = [r[1] for r in rows if r[5] > 0]
+        if set(pk_cols) == {"id", "run_id"}:
+            return
+        with self.lock:
+            self.conn.execute("ALTER TABLE wbs_nodes RENAME TO wbs_nodes__old")
+            self.conn.execute("""
+                CREATE TABLE wbs_nodes (
+                    id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    parent_id TEXT,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    capability TEXT NOT NULL,
+                    complexity INTEGER NOT NULL,
+                    dependencies_json TEXT NOT NULL DEFAULT '[]',
+                    parallelizable INTEGER NOT NULL DEFAULT 1,
+                    deliverable TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempt INTEGER NOT NULL DEFAULT 1,
+                    checkpoint INTEGER NOT NULL DEFAULT 0,
+                    result TEXT,
+                    session_id TEXT,
+                    duration_seconds REAL,
+                    error TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+                    brief TEXT DEFAULT '',
+                    shared_brief TEXT DEFAULT '',
+                    estimated_duration INTEGER DEFAULT NULL,
+                    write_targets_json TEXT DEFAULT '[]',
+                    result_struct_json TEXT DEFAULT NULL,
+                    skills_json TEXT DEFAULT NULL,
+                    tools_json TEXT DEFAULT NULL,
+                    fingerprint TEXT DEFAULT '',
+                    PRIMARY KEY (id, run_id),
+                    FOREIGN KEY(run_id) REFERENCES runs(id)
+                )
+            """)
+            self.conn.execute("""
+                INSERT INTO wbs_nodes
+                  (id, run_id, parent_id, title, description, capability,
+                   complexity, dependencies_json, parallelizable, deliverable,
+                   status, attempt, checkpoint, result, session_id,
+                   duration_seconds, error, created_at, updated_at,
+                   brief, shared_brief, estimated_duration, write_targets_json,
+                   result_struct_json, skills_json, tools_json, fingerprint)
+                SELECT id, run_id, parent_id, title, description, capability,
+                   complexity, dependencies_json, parallelizable, deliverable,
+                   status, attempt,
+                   COALESCE(checkpoint, 0),
+                   result, session_id, duration_seconds, error, created_at, updated_at,
+                   COALESCE(brief, ''), COALESCE(shared_brief, ''),
+                   COALESCE(estimated_duration, NULL),
+                   COALESCE(write_targets_json, '[]'),
+                   COALESCE(result_struct_json, NULL),
+                   COALESCE(skills_json, NULL),
+                   COALESCE(tools_json, NULL),
+                   COALESCE(fingerprint, '')
+                FROM wbs_nodes__old
+            """)
+            self.conn.execute("DROP TABLE wbs_nodes__old")
+            self.conn.commit()
+
     def _execute(self, sql: str, params: tuple = ()):
+        sql = sql.replace("CURRENT_TIMESTAMP", "datetime('now','localtime')")
         with self.lock:
             cur = self.conn.execute(sql, params)
             self.conn.commit()
             return cur
 
     def _query(self, sql: str, params: tuple = ()):
+        sql = sql.replace("CURRENT_TIMESTAMP", "datetime('now','localtime')")
         with self.lock:
             return self.conn.execute(sql, params).fetchall()
 
     def _one(self, sql: str, params: tuple = ()):
+        sql = sql.replace("CURRENT_TIMESTAMP", "datetime('now','localtime')")
         with self.lock:
             return self.conn.execute(sql, params).fetchone()
 
@@ -366,6 +324,30 @@ class CollabStore:
     def update_run(self, run_id: str, status: str) -> None:
         completed_sql = ", completed_at=CURRENT_TIMESTAMP" if status in {"completed", "failed"} else ""
         self._execute(f"UPDATE runs SET status=?, updated_at=CURRENT_TIMESTAMP{completed_sql} WHERE id=?", (status, run_id))
+
+    def set_run_meta(self, run_id: str, meta: dict[str, Any]) -> None:
+        """Persist a per-run metadata blob (e.g. selected package + skill set).
+
+        The dict is stored as JSON in ``runs.meta_json`` and is overwritten on
+        each call. Existing keys not present in *meta* are preserved.
+        """
+        existing = self.get_run_meta(run_id) or {}
+        merged = dict(existing)
+        merged.update(meta)
+        self._execute(
+            "UPDATE runs SET meta_json=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (json.dumps(merged, ensure_ascii=False), run_id),
+        )
+
+    def get_run_meta(self, run_id: str) -> dict[str, Any] | None:
+        row = self._one("SELECT meta_json FROM runs WHERE id=?", (run_id,))
+        if not row:
+            return None
+        raw = row["meta_json"] or "{}"
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
 
     def latest_run_id(self) -> str | None:
         row = self._one("SELECT id FROM runs ORDER BY created_at DESC LIMIT 1")
@@ -437,32 +419,10 @@ class CollabStore:
         running work becomes failed, and unscheduled pending work is marked failed so
         dashboards never keep showing a parent process that was interrupted as live.
 
-        2026-06-17 fix (stale-cleanup): the previous version called `_execute`
-        4 times, each of which commits individually. The 22-hour operator
-        cleanup on 2026-06-17 (`run_ff08ec4ab2ce` + 2 other runs from 6-16
-        all had stale `running`/`pending` wbs rows after `runs.completed_at`
-        was set) showed this was a real data-loss scenario: the first
-        `update_run` to set `runs.status='failed'` and `completed_at`
-        committed durably, then a SIGKILL on the parent CLI between that
-        commit and the next `_execute` left the wbs UPDATEs unflushed. The
-        `_ensure_schema` PRAGMA `synchronous=FULL` (set at connect time)
-        means every commit now waits for fsync, but that does not protect
-        against a process being killed *between* statements. The new
-        implementation wraps all 4 writes + the log + the add_lesson in
-        one explicit transaction (`BEGIN IMMEDIATE` ... `COMMIT`), so the
-        entire cleanup is all-or-nothing. If anything raises inside the
-        block, the transaction is ROLLED BACK and the run stays in its
-        previous state (still showing the work as in-flight, which is
-        strictly safer than the previous "partial commit = ghost
-        running" failure mode). After COMMIT, `wal_checkpoint(TRUNCATE)`
-        forces the WAL frame for this transaction to be merged into the
-        main DB file, so a subsequent SIGKILL on the parent cannot leave
-        the wbs UPDATEs in an uncheckpointed WAL that gets rolled back on
-        the next process start.
+        All writes are wrapped in a single ``BEGIN IMMEDIATE`` ... ``COMMIT``
+        transaction so a SIGKILL between statements cannot produce the "run terminal,
+        wbs still running" partial-commit state. See engine-run-failure-modes.md.
         """
-        # Use the connection directly so we control BEGIN/COMMIT.
-        # `_execute` would commit between statements, defeating the
-        # purpose of wrapping this in one transaction.
         with self.lock:
             try:
                 self.conn.execute("BEGIN IMMEDIATE")
@@ -474,25 +434,14 @@ class CollabStore:
                     "UPDATE wbs_nodes SET status='failed', error=COALESCE(error, ?), updated_at=CURRENT_TIMESTAMP WHERE run_id=? AND status IN ('running','pending')",
                     (reason, run_id),
                 )
-                # Mirror the previous `update_run(run_id, "failed")` semantics
-                # (sets completed_at only on terminal status) — but inline
-                # because we cannot use `update_run` (it would commit
-                # mid-transaction via `_execute`).
                 self.conn.execute(
                     "UPDATE runs SET status='failed', updated_at=CURRENT_TIMESTAMP, completed_at=CURRENT_TIMESTAMP WHERE id=?",
                     (run_id,),
                 )
-                # Log + lesson live inside the same transaction so a
-                # partial failure doesn't write a "cleanup complete" log
-                # without the actual UPDATEs behind it.
                 self.conn.execute(
                     "INSERT INTO logs(run_id,node_id,level,message,data_json) VALUES(?,?,?,?,?)",
                     (run_id, None, "error", "run interrupted; stale running work marked failed", json.dumps({"reason": reason}, ensure_ascii=False)),
                 )
-                # Mirror `add_lesson(...)` inline for the same reason.
-                # `add_lesson` may call other helpers; inlining keeps
-                # the transaction boundary crisp. The lesson text matches
-                # the original to keep distill output stable.
                 self.conn.execute(
                     "INSERT INTO lessons(scope,category,lesson,evidence_json) VALUES(?,?,?,?)",
                     (
@@ -504,27 +453,14 @@ class CollabStore:
                 )
                 self.conn.commit()
             except Exception:
-                # ROLLBACK must happen on a different code path than
-                # COMMIT; do it explicitly so a partial cleanup never
-                # produces the "run terminal, wbs still running" state
-                # the operator was cleaning up.
                 try:
                     self.conn.execute("ROLLBACK")
                 except sqlite3.Error:
                     pass
                 raise
-            # Force WAL → DB merge. The COMMIT above already
-            # synchronous-FULL-fsynced the WAL frame; TRUNCATE here
-            # also resets the WAL so a future SIGKILL has a clean
-            # checkpoint boundary. Passive checkpoint (default) would
-            # be lazy; TRUNCATE is the explicit "this transaction is
-            # durably merged into the main DB file" guarantee.
             try:
                 self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except sqlite3.Error:
-                # wal_checkpoint can fail under read-only mounts or
-                # when the DB has been replaced; the data is still
-                # durable from the COMMIT, so log and continue.
                 pass
 
     def insert_wbs_node(self, run_id: str, node: dict[str, Any]) -> None:
@@ -645,10 +581,19 @@ class CollabStore:
         return {"runs": scalar("SELECT COUNT(*) FROM runs"), "running": scalar("SELECT COUNT(*) FROM runs WHERE status='running'"), "completed": scalar("SELECT COUNT(*) FROM runs WHERE status='completed'"), "failed": scalar("SELECT COUNT(*) FROM runs WHERE status='failed'"), "workers_running": scalar("SELECT COUNT(*) FROM workers WHERE status='running'"), "lessons": scalar("SELECT COUNT(*) FROM lessons")}
 
     def list_runs(self, status: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
-        columns = "id,title,status,created_at,updated_at,completed_at,agent"
+        columns = "id,title,status,created_at,updated_at,completed_at,agent,meta_json"
         if status:
-            return [dict(r) for r in self._query(f"SELECT {columns} FROM runs WHERE status=? ORDER BY created_at DESC LIMIT ?", (status, limit))]
-        return [dict(r) for r in self._query(f"SELECT {columns} FROM runs ORDER BY created_at DESC LIMIT ?", (limit,))]
+            rows = [dict(r) for r in self._query(f"SELECT {columns} FROM runs WHERE status=? ORDER BY created_at DESC LIMIT ?", (status, limit))]
+        else:
+            rows = [dict(r) for r in self._query(f"SELECT {columns} FROM runs ORDER BY created_at DESC LIMIT ?", (limit,))]
+        for r in rows:
+            # Decode meta_json once on read so the dashboard can render package/skill tags
+            raw = r.get("meta_json") or "{}"
+            try:
+                r["meta"] = json.loads(raw)
+            except json.JSONDecodeError:
+                r["meta"] = {}
+        return rows
 
     def latest_resumable_run(self) -> dict[str, Any] | None:
         row = self._one(

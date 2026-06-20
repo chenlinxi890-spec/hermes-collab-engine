@@ -24,6 +24,30 @@ All notable public changes to Hermes Collab Engine are documented here.
 - Aggregate node: truncate result_struct and request fields
 - Ghost running: pending nodes with failed dependencies now properly cleaned up on engine restart
 
+## v5.6.1 — 2026-06-20
+
+### Resource-pressure watchdog improvements
+- **SIGKILL → killpg**：Watchdog 杀死 worker 时使用 `os.killpg` 杀整个进程组，消灭幽灵子进程
+- **Deferred retry queue**：被 watchdog 杀的节点不立即重试，放入 `_deferred_queue` 等待资源恢复
+- **恢复守护**：每 60s 检查 CPU/MEM，资源空闲（<70%）时自动重新 dispatch 被延迟的节点
+- **超时保护**：deferred 节点 600s 内无法恢复 → 标记 failed，防止无限等待
+
+### Shard value threshold (MIN_SHARD_WORK=180)
+- 最小分片颗粒度从 2min 提升至 **3min**，确保分片收益 > 开销
+- 最大片数从 8 降至 **4**，减少并发压力
+- 5min 以内任务不拆分
+
+### Ghost running root cause fix
+- 预算耗尽分支补 `pending.pop(node.id)`，防止 pending 字典遗留导致死循环
+- 父节点在 budget exhausted 时正确 reconcile
+
+### Timezone fix
+- SQLite `CURRENT_TIMESTAMP`（UTC）→ `datetime('now','localtime')`（CST）
+- store.py `_execute`/`_query`/`_one` 统一替换，新数据全部使用本地时间
+
+### misc
+- store.py 新增 `get_run_meta()` + `_migrate_runs_meta_json()`（与 dragon-team 同步）
+
 ## v5.0.0 — First formal public release
 
 Hermes Collab Engine v5.0.0 is the first formal public release line for the standalone Hermes collaboration workflow. Earlier v4.5 materials remain useful as internal/pre-release lineage, but v5.0.0 is the baseline intended for public review, installation, sandbox demos, and downstream release notes.

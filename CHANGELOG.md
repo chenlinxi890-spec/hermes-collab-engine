@@ -2,6 +2,28 @@
 
 All notable public changes to Hermes Collab Engine are documented here.
 
+## v5.6.0 — 2026-06-20
+
+### Resource-driven proactive splitting
+- **分片策略重写**：从基于 timeout 剩余时间改为基于任务估算量 + 系统负载 + WBS 最小颗粒度四级决策
+- **负载感知 dispatch**：CPU > 85% 或 MEM > 90% 时暂停派发新 worker，等 watchdog 先清理资源
+- **ARG_MAX 防护**：prompt 拼装后 900KB 硬截断，防止 subprocess.Popen 因 argv 超长崩溃
+
+### shadcn/ui MCP & ui-design-v2 skill
+- 新增 shadcn-ui MCP 服务器（4 工具：list_components, get_component, list_blocks, get_block）
+- 新增 ui-design-v2 skill：shadcn/ui v4 高级审美规范（Linear/Stripe/Vercel 风格）
+- 更新 skill_distributor.py 映射表，MCP 去重合并重构
+
+### Model connectivity test
+- start.py 交互式启动时自动测试 Leader/Worker 模型可达性
+- 支持 OpenAI / Anthropic / provider-routed 三种适配格式
+- 失败可重试或跳过
+
+### Bug fixes
+- ARG_MAX hard truncation in _run_worker (900KB cap)
+- Aggregate node: truncate result_struct and request fields
+- Ghost running: pending nodes with failed dependencies now properly cleaned up on engine restart
+
 ## v5.0.0 — First formal public release
 
 Hermes Collab Engine v5.0.0 is the first formal public release line for the standalone Hermes collaboration workflow. Earlier v4.5 materials remain useful as internal/pre-release lineage, but v5.0.0 is the baseline intended for public review, installation, sandbox demos, and downstream release notes.

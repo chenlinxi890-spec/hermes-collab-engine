@@ -35,6 +35,7 @@ SKILL_TOOL_MAP: dict[str, list[str]] = {
     "risk-checkpoint":          [],
     "browser-automation":       ["browser-automation"],
     "frontend-optimization":   ["file-edit", "git-local"],
+    "ui-design-v2":            ["file-edit", "mcp-readonly"],
 }
 
 
@@ -80,6 +81,11 @@ SKILL_MCP_MAP: dict[str, dict] = {
         "agent_compat": ["claude-code", "hermes"],
         "readonly": True,
     },
+    "ui-design-v2": {
+        "mcp_servers": ["shadcn-ui"],
+        "agent_compat": ["claude-code", "hermes"],
+        "readonly": True,
+    },
 }
 
 
@@ -102,19 +108,24 @@ CAPABILITY_DEFAULT_SKILL: dict[str, str] = {
     "design":           "frontend-optimization",
     "frontend":         "frontend-optimization",
     "ui":               "frontend-optimization",
+    "design-v2":        "ui-design-v2",
 }
 
 
 # ── Map consistency validation ─────────────────────────────────────────
 
 
-def validate_maps(tool_registry: Any = None) -> list[str]:
+def validate_maps(tool_registry: Any = None, skill_registry: Any = None) -> list[str]:
     """Check consistency between SKILL_TOOL_MAP, SKILL_MCP_MAP, and
     CAPABILITY_DEFAULT_SKILL.
 
     If *tool_registry* (a ``ToolRegistry`` instance) is provided, also
     validates that every tool profile name referenced in ``SKILL_TOOL_MAP``
     values is actually registered in the tool registry.
+
+    If *skill_registry* (a ``SkillRegistry`` instance) is provided, also
+    validates that every skill name referenced in the maps actually exists
+    as a registered entry in the skill registry.
 
     Returns a list of warning messages (empty if all checks pass).
     Call at import time or during test setup to catch drift early.
@@ -155,13 +166,26 @@ def validate_maps(tool_registry: Any = None) -> list[str]:
                         f"profile {t!r} — not found in ToolRegistry"
                     )
 
+    # Validate that every skill name referenced in CAPABILITY_DEFAULT_SKILL
+    # actually has a registered entry in the SkillRegistry.
+    if skill_registry is not None:
+        for cap, skill in CAPABILITY_DEFAULT_SKILL.items():
+            if skill_registry.get(skill) is None:
+                warnings.append(
+                    f"CAPABILITY_DEFAULT_SKILL[{cap!r}] = {skill!r} not found in SkillRegistry"
+                )
+        for name in all_skill_names:
+            if skill_registry.get(name) is None:
+                warnings.append(
+                    f"Skill {name!r} exists in SKILL_TOOL_MAP/SKILL_MCP_MAP "
+                    f"but has no registered SkillRegistry entry"
+                )
+
     return warnings
 
 
 # validate_maps() is available for testing — call it with your live registries
-# to verify SKILL_TOOL_MAP references exist. Not run at import time because
-# the registries are not available yet.
-
+# to verify SKILL_TOOL_MAP references exist.
 
 class SkillDistributor:
     """Resolve skills, tools, and MCP servers for a specific worker node."""
@@ -243,18 +267,8 @@ class SkillDistributor:
 
         Returns a list of dicts with keys: name, readonly.
         The list is filtered by agent compatibility and current availability.
-
-        Readonly merge policy: when the same MCP server type is referenced by
-        multiple skills with different readonly flags, the permissive (OR) rule
-        applies — if *any* skill needs read-write access (readonly=False), the
-        merged result is read-write. This is because a more restrictive policy
-        (first-writer-wins, the previous behaviour) would silently deny write
-        access to a skill that legitimately needs it, causing confusing worker
-        failures.
         """
-        needed: list[dict] = []
-        # Track per server: readonly flag, merged permissively (any RW → RW).
-        seen_servers: dict[str, bool] = {}  # server_name → readonly
+        needed_map: dict[str, dict] = {}
 
         for s in skill_names:
             entry = SKILL_MCP_MAP.get(s, {})
@@ -263,18 +277,18 @@ class SkillDistributor:
                 continue  # this MCP type doesn't support this agent
 
             for mcp_type in entry.get("mcp_servers", []):
-                this_readonly = entry.get("readonly", True)
-                if mcp_type in seen_servers:
-                    # Permissive merge: if any skill needs read-write, grant it.
-                    seen_servers[mcp_type] = seen_servers[mcp_type] and this_readonly
+                if mcp_type not in needed_map:
+                    needed_map[mcp_type] = {
+                        "name": mcp_type,
+                        "readonly": entry.get("readonly", True),
+                    }
                 else:
-                    seen_servers[mcp_type] = this_readonly
+                    # Merge readonly flags: if any skill needs write access,
+                    # the server should be read-write (not readonly).
+                    if not entry.get("readonly", True):
+                        needed_map[mcp_type]["readonly"] = False
 
-        for mcp_type, readonly in seen_servers.items():
-            needed.append({
-                "name": mcp_type,
-                "readonly": readonly,
-            })
+        needed = list(needed_map.values())
 
         # If UnifiedRegistry is available, cross-check against live MCP servers
         if self.unified_registry is not None:
@@ -288,6 +302,27 @@ class SkillDistributor:
                 pass  # registry unavailable; return as-configured
 
         return needed
+
+    @staticmethod
+    def combine_mcp_configs(*mcp_lists: list[dict]) -> list[dict]:
+        """Merge multiple MCP server config lists into one deduplicated list.
+
+        When the same server name appears in multiple lists with different
+        ``readonly`` values, the combined entry uses ``readonly=False``
+        (read-write), because any skill needing write access must get it.
+
+        This is useful when combining MCP results from two independently
+        resolved skill groups (e.g. plan-level + node-level overrides).
+        """
+        merged: dict[str, dict] = {}
+        for mcp_list in mcp_lists:
+            for m in mcp_list:
+                name = m["name"]
+                if name not in merged:
+                    merged[name] = dict(m)
+                elif not m.get("readonly", True):
+                    merged[name]["readonly"] = False
+        return list(merged.values())
 
     def render_for_prompt(
         self,
@@ -344,4 +379,5 @@ __all__ = [
     "SKILL_MCP_MAP",
     "CAPABILITY_DEFAULT_SKILL",
     "SkillDistributor",
+    "validate_maps",
 ]

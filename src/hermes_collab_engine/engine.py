@@ -452,6 +452,18 @@ class CollabEngine:
                                             run_id=run_id)
                             continue
 
+                        # 2026-06-20: load-aware dispatch — if system is
+                        # under pressure, don't submit more workers; let the
+                        # watchdog kill a worker first to free resources.
+                        _cpu_now = self._get_cpu_percent() or 0
+                        _mem_now = self._get_mem_percent() or 0
+                        if _cpu_now > 85 or _mem_now > 90:
+                            self.store.log(run_id, "warning",
+                                "dispatch paused: system under pressure",
+                                {"cpu": f"{_cpu_now:.0f}%", "mem": f"{_mem_now:.0f}%",
+                                 "node": node.id, "running": len(running)},
+                                node.id)
+                            break
                         future = pool.submit(self._run_node_with_retries, run_id, node, self._effective_timeout(node, timeout, started_at), max_retries, split_count)
                         running[future] = node
                         running_started[future] = time.time()
@@ -714,14 +726,64 @@ class CollabEngine:
         return min(timeout, remaining)
 
     def _should_split_proactively(self, node: WBSNode, timeout: int, max_retries: int, split_count: int, started_at: float) -> bool:
+        """Resource-driven proactive split decision.
+
+        Splits based on:
+        1. Task estimated duration (bigger = more shards)
+        2. System load factor (busy = fewer shards)
+        3. WBS minimum granularity (each shard >= 2 min of work)
+        4. Available concurrency slots
+        5. User --split-count CLI cap
+        """
         if split_count <= 1 or not node.estimated_duration:
             return False
         try:
-            estimated_timeout = int(node.estimated_duration) * 2
+            est = int(node.estimated_duration)
         except (TypeError, ValueError):
             return False
-        remaining = max(1, timeout - (time.time() - started_at))
-        return estimated_timeout > remaining
+
+        # 1. Base shard count by task size
+        if est > 1200:
+            target = 8
+        elif est > 600:
+            target = 6
+        elif est > 300:
+            target = 4
+        elif est > 120:
+            target = 2
+        else:
+            return False  # < 2 min, no split
+
+        # 2. Load factor: system busy → fewer shards
+        cpu = self._get_cpu_percent() or 0
+        mem = self._get_mem_percent() or 0
+        if cpu > 85 or mem > 90:
+            return False  # under pressure, no split at all
+        elif cpu > 70 or mem > 80:
+            factor = 0.25
+        elif cpu > 50 or mem > 60:
+            factor = 0.5
+        else:
+            factor = 1.0
+        import math
+        target = max(2, int(math.ceil(target * factor)))
+
+        # 3. WBS min granularity: each shard >= 2 min of work
+        target = min(target, max(2, est // 120))
+
+        # 4. Available concurrency slots
+        running_count = len(self._worker_procs)
+        available = max(1, running_count)  # at least 1
+        # Cap: don't split more than available slots x 2
+        slot_limit = max(1, running_count) * 2
+        target = min(target, slot_limit)
+
+        # 5. User --split-count hard cap
+        target = min(target, split_count)
+
+        # Store the computed shard count for _split_node
+        self._proactive_shard_count = target
+        return target > 1
 
     # ── Resource monitoring ────────────────────────────────────────────
     @staticmethod
@@ -1289,8 +1351,8 @@ class CollabEngine:
         skill set for *every* node unless a node already has skills_json.
         """
         native_caps = set(self.agent_backend.capabilities)
-        package_meta = {}
-        package_skills: list[str] = []
+        package_meta = self.store.get_run_meta(run_id) or {}
+        package_skills: list[str] = list(package_meta.get("package_skills") or [])
         for node in nodes:
             try:
                 # Respect leader-assigned values; only fill gaps via distributor
@@ -1692,6 +1754,17 @@ Output contract:
 - On the final line, include exactly one machine-readable JSON object prefixed by {self._RESULT_MARKER}
 - Use this JSON shape: {{"status":"ok|blocked|failed","summary":"short result summary","files_modified":["path"],"verification":["command or check"],"notes":["optional note"]}}
 {backend.prompt_suffix}"""
+        # 2026-06-20 fix: hard cap prompt size to prevent ARG_MAX overflow.
+        _PROMPT_SAFE_MAX_BYTES = 900_000
+        _prompt_bytes = prompt.encode("utf-8", errors="replace")
+        if len(_prompt_bytes) > _PROMPT_SAFE_MAX_BYTES:
+            _half = _PROMPT_SAFE_MAX_BYTES // 2
+            _hl = len(_prompt_bytes)
+            _msg = "\n\n...[PROMPT TRUNCATED: " + str(_hl) + " bytes > " + str(_PROMPT_SAFE_MAX_BYTES) + " limit]...\n\n"
+            prompt = prompt[:_half] + _msg + prompt[-_half:]
+            self.store.log(run_id, "warning", "prompt truncated for ARG_MAX",
+                {"node": node.id, "original_bytes": _hl,
+                 "truncated_to": _PROMPT_SAFE_MAX_BYTES}, node.id)
         selected_model = model_override or self.worker_model
         # If prompt is too long for command-line args, use stdin via temp file.
         # Only applies to backends with a prompt_flag (e.g. claude -p "...");
@@ -1861,21 +1934,25 @@ Output contract:
         self.store.insert_wbs_node(run_id, node.to_dict())
         self.store.update_node(node.id, "running", run_id=run_id)
         # 2026-06-19 fix: strip large result bodies to prevent prompt exceeding
-        # ARG_MAX (~2MB). Worker result.result can contain entire file contents
-        # (e.g. a 1900-line HTML file). Pass only summary/metadata to the
-        # aggregator — the full content is in the DB and is not needed for the
-        # final report because the aggregator just produces a summary.
-        _AGGREGATE_RESULT_MAX_CHARS = 2000  # truncate individual results to this
+        # ARG_MAX (~2MB). Worker result.result can contain entire file contents.
+        _AGGREGATE_RESULT_MAX_CHARS = 500
         trimmed = []
         for r in results:
             d = r.to_dict()
             if d.get("result") and len(d["result"]) > _AGGREGATE_RESULT_MAX_CHARS:
-                d["result"] = d["result"][:_AGGREGATE_RESULT_MAX_CHARS] + f"\n... [truncated {len(d['result'])} chars for aggregation]"
+                d["result"] = d["result"][:_AGGREGATE_RESULT_MAX_CHARS] + f"\n... [truncated {len(d['result'])} chars]"
+            if d.get("result_struct") and isinstance(d["result_struct"], dict):
+                rs_json = json.dumps(d["result_struct"], ensure_ascii=False)
+                if len(rs_json) > 500:
+                    d["result_struct"] = {"_truncated": f"result_struct too large ({len(rs_json)} chars)"}
             trimmed.append(d)
         report = json.dumps(trimmed, ensure_ascii=False, indent=2)
+        _AGGREGATE_REQUEST_MAX_CHARS = 500
+        if len(request) > _AGGREGATE_REQUEST_MAX_CHARS:
+            request = request[:_AGGREGATE_REQUEST_MAX_CHARS] + f"\n... [truncated {len(request)} chars]"
         # Surface the Leader-selected package + Skill collection so the
         # aggregator has the full context when writing the final report.
-        meta = {}
+        meta = self.store.get_run_meta(run_id) or {}
         package_name = meta.get("package")
         package_skills = list(meta.get("package_skills") or [])
         package_block = ""

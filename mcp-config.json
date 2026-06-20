@@ -43,6 +43,17 @@
         "list_components",
         "search_components"
       ]
+    },
+    "shadcn-ui": {
+      "command": "npx",
+      "args": ["-y", "@jpisnice/shadcn-ui-mcp-server"],
+      "env": {},
+      "tools": [
+        "list_components",
+        "get_component",
+        "list_blocks",
+        "get_block"
+      ]
     }
   }
 }

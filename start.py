@@ -614,6 +614,151 @@ def ask_agent_config(role_label: str, prev: dict, schema: dict | None = None) ->
     return out
 
 
+# ── Model connectivity test ────────────────────────────────────────────
+
+
+def test_model_connectivity(base_url: str, api_key: str, model: str,
+                            adapter_format: str = 'auto',
+                            timeout: int = 15) -> tuple[bool, str]:
+    """Test whether *model* at *base_url* with *api_key* responds.
+
+    Uses *adapter_format* (from ADAPTER_FIELD_SCHEMA) to choose the
+    most likely endpoint path and auth method, then falls through a
+    comprehensive list of alternatives so the test works for **any**
+    upstream provider (OpenAI / Anthropic / provider-routed / custom).
+
+    Probe strategies per format:
+
+    ================== ==================================== ====================
+    ``adapter_format`` Primary endpoint                     Auth headers
+    ================== ==================================== ====================
+    ``openai``         ``/v1/chat/completions``             ``Bearer {key}``
+    ``anthropic``      ``/v1/messages``                     ``x-api-key: {key}``
+    ``provider-routed`` ``/v1/chat/completions``            ``Bearer {key}``
+    ``auto``           Try all endpoints                    Both auth headers
+    ================== ==================================== ====================
+
+    Each format also falls back to the other format's endpoints so
+    mis-classified or unusual gateways still work.
+
+    Guardrails:
+      - Handles base_url that already ends with ``/v1`` (no double-path).
+      - Adds ``https://`` scheme if missing.
+      - Always sends ``User-Agent`` header (required by some gateways).
+      - Reports **every** attempted URL with its response so users
+        can debug without reading source.
+
+    Returns ``(ok, context)`` where *ok* is True on success and
+    *context* is the model name returned by the API (or the configured
+    model name if the response omits it).  On failure *context* is a
+    multi-line error report showing all attempts.
+    """
+    if not base_url or not api_key or not model:
+        return False, 'base_url / api_key / model 不能为空'
+
+    import urllib.request as _req
+    import urllib.error as _err
+    import ssl as _ssl
+
+    ctx = _ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = _ssl.CERT_NONE
+
+    # ── Normalise URL ───────────────────────────────────────────────
+    base = base_url.strip()
+    if not base.startswith(('http://', 'https://')):
+        base = 'https://' + base
+    base = base.rstrip('/')
+
+    # Strip /v1 if present so we can re-add it cleanly.
+    base_v1_stripped = base[:-3] if base.endswith('/v1') else base
+    if base_v1_stripped.endswith('/'):
+        base_v1_stripped = base_v1_stripped.rstrip('/')
+
+    # ── Build probe plan ────────────────────────────────────────────
+    # Each entry: (suffix, [header_specs])
+    # header_spec: "bearer" | "x-api-key" | "both"
+    PROBE_SUITES = {
+        'openai': [
+            ('/v1/chat/completions', ['bearer', 'both']),
+            ('/chat/completions',     ['bearer', 'both']),
+            ('/v1/messages',          ['x-api-key', 'both']),
+        ],
+        'anthropic': [
+            ('/v1/messages',          ['x-api-key', 'both']),
+            ('/messages',             ['x-api-key', 'both']),
+            ('/v1/chat/completions',  ['bearer', 'both']),
+        ],
+        'provider-routed': [
+            ('/v1/chat/completions',  ['bearer', 'both']),
+            ('/v1/messages',          ['x-api-key', 'both']),
+            ('/chat/completions',     ['bearer', 'both']),
+        ],
+        'auto': [
+            ('/v1/chat/completions',  ['both']),
+            ('/v1/messages',          ['both']),
+            ('/chat/completions',     ['both']),
+        ],
+    }
+
+    plan = PROBE_SUITES.get(adapter_format, PROBE_SUITES['auto'])
+
+    payload = json.dumps({
+        'model': model,
+        'messages': [{'role': 'user', 'content': 'ping'}],
+        'max_tokens': 3,
+    }).encode()
+
+    # ── Headers factory ─────────────────────────────────────────────
+    def _make_headers(spec: str) -> dict[str, str]:
+        h = {
+            'Content-Type': 'application/json',
+            'User-Agent':   'HermesCollabEngine/5.0',
+        }
+        if spec in ('bearer', 'both'):
+            h['Authorization'] = f'Bearer {api_key}'
+        if spec in ('x-api-key', 'both'):
+            h['x-api-key'] = api_key
+            h['anthropic-version'] = '2023-06-01'
+        return h
+
+    # ── Run probes ──────────────────────────────────────────────────
+    errors: list[str] = []
+    tried = 0
+    for suffix, auth_specs in plan:
+        # Smart URL base: if suffix already starts with /v1, don't
+        # add another /v1 to the base; otherwise append /v1.
+        if suffix.startswith('/v1'):
+            url_base = base_v1_stripped
+        else:
+            url_base = base_v1_stripped + '/v1'
+        url = url_base.rstrip('/') + suffix
+
+        for auth in auth_specs:
+            tried += 1
+            headers = _make_headers(auth)
+            req = _req.Request(url, data=payload, headers=headers, method='POST')
+            try:
+                resp = _req.urlopen(req, timeout=timeout, context=ctx)
+                if resp.status == 200:
+                    body = json.loads(resp.read().decode('utf-8'))
+                    returned_model = body.get('model', model)
+                    return True, returned_model
+                error_text = resp.read().decode('utf-8', errors='replace')[:150]
+                errors.append(f'  {url} (auth={auth}) → HTTP {resp.status}: {error_text}')
+            except _err.HTTPError as e:
+                error_text = e.read().decode('utf-8', errors='replace')[:150]
+                errors.append(f'  {url} (auth={auth}) → HTTP {e.code}: {error_text}')
+            except Exception as e:
+                errors.append(f'  {url} (auth={auth}) → {str(e)[:80]}')
+
+    headline = f'模型连通性测试失败，尝试了 {tried} 种请求组合（format={adapter_format}）：'
+    detail = '\n'.join(errors[:8])  # cap at 8 lines to avoid wall of text
+    if len(errors) > 8:
+        detail += f'\n  … 还有 {len(errors) - 8} 种组合未显示'
+    return False, f'{headline}\n{detail}'
+
+
 def choose_worker_agent(prev: str = '') -> str:
     """Prompt the user to pick which agent backend the engine will spawn for
     worker nodes. Lists every registered adapter and annotates the ones whose
@@ -1105,8 +1250,56 @@ def main():
     else:
         worker_agent = choose_worker_agent(prev_runtime.get('worker_agent', '') or 'claude-code')
         schema = ADAPTER_FIELD_SCHEMA.get(worker_agent, ADAPTER_FIELD_SCHEMA['claude-code'])
-        leader = ask_agent_config('Leader Agent（规划/聚合大脑）', prev_leader, schema=schema)
-        worker = ask_agent_config('Worker Agent（执行器大脑）',  prev_worker, schema=schema)
+
+        # ── Collect leader config with connectivity test ──
+        max_attempts = 5
+        leader = None
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                prev_leader = leader  # keep previous entries so user can edit
+            leader = ask_agent_config('Leader Agent（规划/聚合大脑）', prev_leader, schema=schema)
+            ok, info = test_model_connectivity(
+                leader['base_url'], leader['api_key'],
+                leader['model'],
+                adapter_format=schema.get('format', 'auto'))
+            if ok:
+                print(f'  ✓ Leader 模型连通性测试通过 — {info}')
+                break
+            print(f'  ✗ Leader 模型连通性测试失败: {info}')
+            if attempt >= max_attempts:
+                print('  已达最大重试次数，继续启动（可能无法使用）...')
+                break
+            choice = input('  按 Enter 重新填写配置，或输入 s 跳过测试继续启动: ').strip()
+            if choice.lower() in ('s', 'skip'):
+                print('  已跳过连通性测试。')
+                break
+            # loop back to re-enter
+        print()
+
+        # ── Collect worker config with connectivity test ──
+        worker = None
+        for attempt in range(1, max_attempts + 1):
+            if attempt > 1:
+                prev_worker = worker  # keep previous entries so user can edit
+            worker = ask_agent_config('Worker Agent（执行器大脑）', prev_worker, schema=schema)
+            ok, info = test_model_connectivity(
+                worker['base_url'], worker['api_key'],
+                worker['model'],
+                adapter_format=schema.get('format', 'auto'))
+            if ok:
+                print(f'  ✓ Worker 模型连通性测试通过 — {info}')
+                break
+            print(f'  ✗ Worker 模型连通性测试失败: {info}')
+            if attempt >= max_attempts:
+                print('  已达最大重试次数，继续启动（可能无法使用）...')
+                break
+            choice = input('  按 Enter 重新填写配置，或输入 s 跳过测试继续启动: ').strip()
+            if choice.lower() in ('s', 'skip'):
+                print('  已跳过连通性测试。')
+                break
+            # loop back to re-enter
+        print()
+
         host = prompt('管理面板监听地址', prev_runtime.get('host') or '0.0.0.0')
         port = prompt('管理面板监听端口', str(prev_runtime.get('port') or '8765'))
         cwd  = prompt('协同任务默认工作目录', prev_runtime.get('cwd') or str(Path.home()))

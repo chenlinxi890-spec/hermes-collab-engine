@@ -93,11 +93,77 @@ _TASK_KEYWORDS: dict[str, tuple[str, ...]] = {
     "search-verify": ("find", "search", "scope", "evidence", "read-only", "locate"),
     "debug-root-cause": ("bug", "debug", "failure", "traceback", "error", "fix"),
     "risk-checkpoint": ("risk", "checkpoint", "security", "permission", "destructive"),
-    "frontend-optimization": ("ui", "frontend", "design", "interface", "css", "tailwind", "daisyui", "component", "responsive", "a11y", "accessibility", "美观", "界面", "布局", "样式"),
 }
 
 
 _BUILTIN_SKILLS = [
+    SkillEntry(
+        name="ui-design-v2",
+        display_name="UI Design v2 — shadcn/ui",
+        category="design",
+        description="Advanced UI design skill using shadcn/ui v4 components with Linear/Stripe/Vercel aesthetic.",
+        content=(
+            "# UI Design v2 — shadcn/ui\n\n"
+            "Build beautiful, modern interfaces using shadcn/ui v4 components with a premium aesthetic "
+            "(Linear / Stripe / Vercel / shadcn style).\n\n"
+            "## Available MCP Tools\n"
+            "The `shadcn-ui` MCP server exposes these tools:\n"
+            "- `list_components` — browse all available shadcn/ui components\n"
+            "- `get_component` — fetch source code, props, and usage for a specific component\n"
+            "- `list_blocks` — explore full block implementations (dashboards, forms, pricing, etc.)\n"
+            "- `get_block` — get a complete block with all its component code\n\n"
+            "## Design Principles\n"
+            "- **Minimal & refined**: generous whitespace, subtle borders, restrained use of color\n"
+            "- **Functional hierarchy**: clear visual weight through typography size/weight, not decorations\n"
+            "- **Subtle interactions**: hover states, focus rings, smooth transitions (`transition-all duration-200`)\n"
+            "- **Monochromatic base**: use grays for structure, one accent color for interactive elements\n"
+            "- **Consistent rhythm**: 4px spacing scale (Tailwind: `p-1` through `p-16`)\n\n"
+            "## Component Usage Guide\n"
+            "- Button variants: `default`, `secondary`, `destructive`, `outline`, `ghost`, `link`\n"
+            "- Card: use `Card`, `CardHeader`, `CardTitle`, `CardDescription`, `CardContent`, `CardFooter`\n"
+            "- Forms: combine `Form`, `Input`, `Label`, `Select`, `Checkbox`, `Textarea` with react-hook-form\n"
+            "- Dialogs: `Dialog` + `DialogTrigger` + `DialogContent` + `DialogHeader` + `DialogTitle` + `DialogDescription`\n"
+            "- Navigation: `Tabs`, `DropdownMenu`, `Command` (cmdk) for command palettes\n"
+            "- Data display: `Table`, `DataTable` (TanStack Table), `Badge`, `Avatar`, `Separator`\n"
+            "- Feedback: `Toast`, `Alert`, `Skeleton`, `Progress`, `Spinner` (via `lucide-react` `Loader2`)\n\n"
+            "## Layout Patterns\n"
+            "- Max-width containers: `max-w-7xl mx-auto px-4 sm:px-6 lg:px-8`\n"
+            "- Responsive grid: `grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6`\n"
+            "- Center sections: `flex items-center justify-center min-h-[calc(100vh-4rem)]`\n"
+            "- Sidebar + content: `flex` with `w-64` sidebar and `flex-1` main area\n\n"
+            "## Typography\n"
+            "- Headings: `text-4xl font-bold tracking-tight`, `text-3xl font-semibold`, `text-2xl font-medium`\n"
+            "- Body: `text-base leading-7 text-muted-foreground`\n"
+            "- Small/caption: `text-sm text-muted-foreground`\n"
+            "- Code/monospace: `font-mono text-sm`\n\n"
+            "## Colors & Theming (shadcn/ui CSS variables)\n"
+            "- `--background` / `--foreground` — page background and default text\n"
+            "- `--card` / `--card-foreground` — card surfaces\n"
+            "- `--primary` / `--primary-foreground` — main accent (usually indigo/blue)\n"
+            "- `--secondary` / `--secondary-foreground` — secondary accent\n"
+            "- `--muted` / `--muted-foreground` — subdued surfaces and text\n"
+            "- `--accent` / `--accent-foreground` — hover/selection states\n"
+            "- `--destructive` / `--destructive-foreground` — errors and deletions\n"
+            "- `--border` / `--input` / `--ring` — borders and focus rings\n"
+            "- Use Tailwind classes: `bg-background`, `text-foreground`, `text-muted-foreground`, `border-border`, etc.\n\n"
+            "## Code Generation Pattern\n"
+            "1. Use `list_components` or `search_components` to find the right component\n"
+            "2. Use `get_component` to fetch exact source code and props\n"
+            "3. Combine components into pages using the layout patterns above\n"
+            "4. Always include: imports, TypeScript types, Tailwind classes, responsive variants\n"
+            "5. For complete sections, use `list_blocks` / `get_block` to get full implementations\n\n"
+            "## Accessibility\n"
+            "- shadcn/ui uses Radix UI primitives — accessibility is built-in\n"
+            "- Always add `aria-label` on icon-only buttons\n"
+            "- Use semantic HTML: `<nav>`, `<main>`, `<section>`, `<footer>`\n"
+            "- Maintain keyboard navigation for all interactive elements\n"
+            "- Respect `prefers-reduced-motion` for animations"
+        ),
+        applicable_node_types=["implementation", "design", "design-v2", "frontend", "ui", "coding"],
+        priority=1,
+        source="hermes",
+        required_tools=["file-edit", "mcp-readonly"],
+    ),
     SkillEntry(
         name="implementation-focus",
         display_name="Focused Implementation",
@@ -108,7 +174,7 @@ _BUILTIN_SKILLS = [
             "- Match surrounding naming, comments, and style.\n"
             "- Report exact files modified and avoid claiming unrun verification."
         ),
-        applicable_node_types=["implementation", "coding"],
+        applicable_node_types=["implementation", "coding", "docs", "general"],
         priority=1,
         source="hermes",
     ),
@@ -256,6 +322,7 @@ _BUILTIN_SKILLS = [
         source="hermes",
     ),
 ]
+
 
 _DEFAULT_REGISTRY = SkillRegistry()
 

@@ -1,10 +1,10 @@
-# Hermes Collab Engine v5.5 — Multi-Agent AI Collaboration Engine
+# Hermes Collab Engine v5.6 — Multi-Agent AI Collaboration Engine
 
-[![English](https://img.shields.io/badge/English-README.en.md-blue)](README.en.md) [![Release v5.5.0](https://img.shields.io/badge/release-v5.5.0-blue)](CHANGELOG.md) [![Sandbox ready](https://img.shields.io/badge/sandbox-ready-success)](sandbox/README.md) [![License MIT](https://img.shields.io/badge/license-MIT-green)](#许可证) [![Security](https://img.shields.io/badge/security-policy-orange)](SECURITY.md)
+[![English](https://img.shields.io/badge/English-README.en.md-blue)](README.en.md) [![Release v5.6.0](https://img.shields.io/badge/release-v5.6.0-blue)](CHANGELOG.md) [![Sandbox ready](https://img.shields.io/badge/sandbox-ready-success)](sandbox/README.md) [![License MIT](https://img.shields.io/badge/license-MIT-green)](#许可证) [![Security](https://img.shields.io/badge/security-policy-orange)](SECURITY.md)
 
 > Open-source multi-agent orchestration for Claude Code, Hermes, Codex, OpenCode, OpenClaw & custom AI agents — plan, split, dispatch, supervise, aggregate.
 
-Hermes Collab Engine v5.5 是面向 **Hermes 协同引擎** 的首个正式公开发布版 **AI multi-agent collaboration engine**：Leader 把需求拆成 WBS，Worker 并行执行，Claude Code / Hermes Agent / 自定义 Agent Backend 可接入同一条协作流水线。
+Hermes Collab Engine v5.6 是面向 **Hermes 协同引擎** 的正式发布版：Leader 把需求拆成 WBS，Worker 并行执行，Claude Code / Hermes Agent / 自定义 Agent Backend 可接入同一条协作流水线。
 
 它同时提供实时 **dashboard**、隔离 **sandbox**、Leader 反馈日记本、轻量 API 与一行安装部署，适合把复杂研发任务拆解、调度、审计并汇总成可读交付物。
 
@@ -64,9 +64,9 @@ hermes-collab run "分析当前项目结构" --cwd . --json
 | Leader 反馈日记本 | 任务完成后弹出像素本子，完整展示 Leader 聚合反馈，支持复制/下载 Markdown |
 | 一行 curl 部署 | 使用上方 `curl ... | bash` 即可安装，模板脚本再按需接入 Hermes |
 
-## v5.5 预览版新增
+## v5.6 新增
 
-> v5.5 是面向开发者的预览版，新增以下功能，欢迎试用反馈。
+> v5.6 新增以下功能，欢迎试用反馈。
 
 ### 统一注册表 (UnifiedRegistry)
 - Skill、Tool、MCP 统一管理，能力标签索引
@@ -89,11 +89,19 @@ hermes-collab run "分析当前项目结构" --cwd . --json
 | baidu-search | 1 工具 | 百度搜索引擎 |
 | open-websearch | 2 工具 | DuckDuckGo + Web 内容提取 |
 | daisyui-blueprint | 1 工具 | daisyUI 组件 AI 生成 (Blueprint MCP) |
+| **shadcn-ui** | **4 工具** | **shadcn/ui v4 组件浏览/获取/块管理，高级审美替代方案** |
 
 ### Skill 系统升级（本周新增）
 - **`search-verify`** skill：多源搜索 → 交叉验证 → 结构化摘要 — 搜索类任务专用
-- **`frontend-optimization`** skill：daisyUI/Tailwind/unocss 设计规范、响应式布局、微动效、无障碍、主题系统 — 前端优化专用
+- **`frontend-optimization`** skill：daisyUI/Tailwind/unocss 设计规范 — 前端优化专用
+- **`ui-design-v2`** skill：shadcn/ui v4 高级审美（Linear/Stripe/Vercel 风格），替代/补充 daisyUI
 - **两引擎同步机制**：upstream (port 8765) + dragon-team (port 8766/8080) 保持代码一致
+
+### 资源驱动分片 & 负载感知 dispatch（本次更新）
+- **分片策略重写**：从基于 timeout 剩余时间改为基于任务估算量 + 系统负载 + WBS 最小颗粒度四级决策
+- **负载感知 dispatch**：CPU > 85% 或 MEM > 90% 时暂停派发新 worker，等 watchdog 先清理资源
+- **ARG_MAX 防护**：prompt 拼装后 900KB 硬截断，防止 subprocess.Popen 因 argv 超长崩溃
+- **模型连通性测试**：交互式启动时自动测试 Leader/Worker 模型可达性，失败可重试或跳过
 
 ### Agent 管理
 - 内置 Agent（claude-code、hermes、codex、opencode）

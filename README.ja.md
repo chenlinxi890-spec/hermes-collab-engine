@@ -1,6 +1,6 @@
-# Hermes Collab Engine v5.0
+# Hermes Collab Engine v6.0 — マルチエージェント協調エンジン
 
-[![Release v5.0.0](https://img.shields.io/badge/release-v5.0.0-blue)](CHANGELOG.md) [![Sandbox ready](https://img.shields.io/badge/sandbox-ready-success)](sandbox/README.md) [![License MIT](https://img.shields.io/badge/license-MIT-green)](#ライセンス) [![Security](https://img.shields.io/badge/security-policy-orange)](SECURITY.md)
+[![中文](https://img.shields.io/badge/中文-README.md-blue)](README.md) [![English](https://img.shields.io/badge/English-README.en.md-blue)](README.en.md) [![Release v6.0](https://img.shields.io/badge/release-v6.0-blue)](CHANGELOG.md) [![Sandbox ready](https://img.shields.io/badge/sandbox-ready-success)](sandbox/README.md) [![License MIT](https://img.shields.io/badge/license-MIT-green)](#ライセンス) [![Security](https://img.shields.io/badge/security-policy-orange)](SECURITY.md)
 
 Hermes Collab Engine v5.0 は Hermes 協調ワークフロー向け **AI multi-agent collaboration engine** の初の正式公開リリースです。Leader が要求を **WBS** ノードへ分解し、Worker が並列実行し、**Claude Code** / **Hermes Agent** / カスタム Agent Backend を同じパイプラインに接続できます。
 

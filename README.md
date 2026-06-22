@@ -1,8 +1,8 @@
-# Hermes Collab Engine v5.6
+# Hermes Collab Engine v6.0
 
 **多智能体协同引擎** — Leader 拆解 WBS → Worker 并行执行 → 结果聚合。
 
-[![English](https://img.shields.io/badge/English-README.en.md-blue)](README.en.md) [![Release v5.6.1](https://img.shields.io/badge/release-v5.6.1-blue)](CHANGELOG.md) [![Sandbox ready](https://img.shields.io/badge/sandbox-ready-success)](sandbox/README.md) [![License MIT](https://img.shields.io/badge/license-MIT-green)](#许可证) [![Security](https://img.shields.io/badge/security-policy-orange)](SECURITY.md)
+[![English](https://img.shields.io/badge/English-README.en.md-blue)](README.en.md) [![Release v6.0](https://img.shields.io/badge/release-v6.0-blue)](CHANGELOG.md) [![Sandbox ready](https://img.shields.io/badge/sandbox-ready-success)](sandbox/README.md) [![License MIT](https://img.shields.io/badge/license-MIT-green)](#许可证) [![Security](https://img.shields.io/badge/security-policy-orange)](SECURITY.md)
 
 多智能体编排引擎，支持 WBS 协同、并行 Worker、Skill/MCP 分发、Lessons 自学习。
 

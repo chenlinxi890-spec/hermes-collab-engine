@@ -14,13 +14,14 @@ from .registry import MCPEntry, SkillEntry, ToolEntry, get_unified_registry
 
 class Planner:
     def __init__(self, cwd: Path, model: str | None = None, timeout: int = 120, store=None,
-                 skill_registry=None, tool_registry=None):
+                 skill_registry=None, tool_registry=None, leader_agent=None):
         self.cwd = cwd
         self.model = model
         self.timeout = timeout
         self.store = store
         self.skill_registry = skill_registry
         self.tool_registry = tool_registry
+        self.leader_agent = leader_agent
 
     def assess(self, request: str) -> ComplexityScore:
         local = self._local_assess(request)
@@ -472,9 +473,12 @@ No prose, no code fences outside the JSON, just the object.
         return Plan(nodes=nodes, shared_brief=shared_brief)
 
     def _claude_json(self, prompt: str):
-        cmd = ["claude", "-p", prompt, "--output-format", "json"]
-        if self.model:
-            cmd.extend(["--model", self.model])
+        if self.leader_agent:
+            cmd = self.leader_agent.build_command(prompt=prompt, model=self.model)
+        else:
+            cmd = ["claude", "-p", prompt, "--output-format", "json"]
+            if self.model:
+                cmd.extend(["--model", self.model])
         proc = subprocess.run(cmd, cwd=self.cwd, text=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=self.timeout)
         if proc.returncode != 0:
             raise RuntimeError(proc.stderr)

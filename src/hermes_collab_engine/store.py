@@ -8,18 +8,17 @@ from typing import Any
 
 from .models import RiskPolicy
 
-SCHEMA = """
-PRAGMA journal_mode=WAL;
-CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY,title TEXT NOT NULL,request TEXT NOT NULL,status TEXT NOT NULL,complexity_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),completed_at TEXT);
-CREATE TABLE IF NOT EXISTS wbs_nodes (id TEXT NOT NULL,run_id TEXT NOT NULL,parent_id TEXT,title TEXT NOT NULL,description TEXT NOT NULL,capability TEXT NOT NULL,complexity INTEGER NOT NULL,dependencies_json TEXT NOT NULL DEFAULT '[]',parallelizable INTEGER NOT NULL DEFAULT 1,deliverable TEXT NOT NULL,status TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,checkpoint INTEGER NOT NULL DEFAULT 0,result TEXT,session_id TEXT,duration_seconds REAL,error TEXT,created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),brief TEXT DEFAULT '',shared_brief TEXT DEFAULT '',estimated_duration INTEGER DEFAULT NULL,write_targets_json TEXT DEFAULT '[]',result_struct_json TEXT DEFAULT NULL,skills_json TEXT DEFAULT NULL,tools_json TEXT DEFAULT NULL,fingerprint TEXT DEFAULT '',PRIMARY KEY (id, run_id),FOREIGN KEY(run_id) REFERENCES runs(id));
-CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY,run_id TEXT NOT NULL,node_id TEXT,status TEXT NOT NULL,started_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),duration_seconds REAL,session_id TEXT,error TEXT);
-CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT,node_id TEXT,level TEXT NOT NULL,message TEXT NOT NULL,data_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')));
-CREATE TABLE IF NOT EXISTS lessons (id INTEGER PRIMARY KEY AUTOINCREMENT,scope TEXT NOT NULL DEFAULT 'global',category TEXT NOT NULL,lesson TEXT NOT NULL,evidence_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')));
-CREATE TABLE IF NOT EXISTS metrics (key TEXT PRIMARY KEY,value_json TEXT NOT NULL,updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')));
-CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value_json TEXT NOT NULL,updated_at TEXT NOT NULL DEFAULT (datetime('now','localtime')));
-CREATE TABLE IF NOT EXISTS node_results (node_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,result_text TEXT DEFAULT '',result_struct_json TEXT DEFAULT NULL,updated_at TEXT DEFAULT (datetime('now','localtime')));
-CREATE TABLE IF NOT EXISTS run_state (run_id TEXT PRIMARY KEY,paused INTEGER DEFAULT 0,checkpoint_paused_nodes_json TEXT DEFAULT '[]',updated_at TEXT DEFAULT (datetime('now','localtime')));
-CREATE TABLE IF NOT EXISTS context_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT NOT NULL,snapshot_type TEXT NOT NULL,node_id TEXT DEFAULT NULL,snapshot_json TEXT NOT NULL,created_at TEXT DEFAULT (datetime('now','localtime')));
+SCHEMA = """PRAGMA journal_mode=WAL;
+CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY,title TEXT NOT NULL,request TEXT NOT NULL,status TEXT NOT NULL,complexity_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,completed_at TEXT);
+CREATE TABLE IF NOT EXISTS wbs_nodes (id TEXT NOT NULL,run_id TEXT NOT NULL,parent_id TEXT,title TEXT NOT NULL,description TEXT NOT NULL,capability TEXT NOT NULL,complexity INTEGER NOT NULL,dependencies_json TEXT NOT NULL DEFAULT '[]',parallelizable INTEGER NOT NULL DEFAULT 1,deliverable TEXT NOT NULL,status TEXT NOT NULL,attempt INTEGER NOT NULL DEFAULT 1,checkpoint INTEGER NOT NULL DEFAULT 0,result TEXT,session_id TEXT,duration_seconds REAL,error TEXT,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,brief TEXT DEFAULT '',shared_brief TEXT DEFAULT '',estimated_duration INTEGER DEFAULT NULL,write_targets_json TEXT DEFAULT '[]',result_struct_json TEXT DEFAULT NULL,skills_json TEXT DEFAULT NULL,tools_json TEXT DEFAULT NULL,fingerprint TEXT DEFAULT '',PRIMARY KEY (id, run_id),FOREIGN KEY(run_id) REFERENCES runs(id));
+CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY,run_id TEXT NOT NULL,node_id TEXT,status TEXT NOT NULL,started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,duration_seconds REAL,session_id TEXT,error TEXT);
+CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT,node_id TEXT,level TEXT NOT NULL,message TEXT NOT NULL,data_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS lessons (id INTEGER PRIMARY KEY AUTOINCREMENT,scope TEXT NOT NULL DEFAULT 'global',category TEXT NOT NULL,lesson TEXT NOT NULL,evidence_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS metrics (key TEXT PRIMARY KEY,value_json TEXT NOT NULL,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value_json TEXT NOT NULL,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS node_results (node_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,result_text TEXT DEFAULT '',result_struct_json TEXT DEFAULT NULL,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS run_state (run_id TEXT PRIMARY KEY,paused INTEGER DEFAULT 0,checkpoint_paused_nodes_json TEXT DEFAULT '[]',updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS context_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT NOT NULL,snapshot_type TEXT NOT NULL,node_id TEXT DEFAULT NULL,snapshot_json TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 """
 
 
@@ -39,7 +38,7 @@ class CollabStore:
         # CRITICAL: format MUST match SQLite CURRENT_TIMESTAMP ('YYYY-MM-DD HH:MM:SS')
         # so string comparison is correct.
         import datetime
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now()
         self._engine_start_ts = now.strftime("%Y-%m-%d %H:%M:%S")
         # Also keep a window (5s) for clock skew between cleanup check and insert
         import time as _time
@@ -279,7 +278,7 @@ class CollabStore:
             return default
 
     def log(self, run_id: str | None, level: str, message: str, data: dict[str, Any] | None = None, node_id: str | None = None) -> None:
-        self._execute("INSERT INTO logs(run_id,node_id,level,message,data_json) VALUES(?,?,?,?,?)", (run_id, node_id, level, message, json.dumps(data or {}, ensure_ascii=False)))
+        self._execute("INSERT INTO logs(run_id,node_id,level,message,data_json,created_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)", (run_id, node_id, level, message, json.dumps(data or {}, ensure_ascii=False)))
 
     def get_setting(self, key: str) -> Any:
         row = self._one("SELECT value_json FROM settings WHERE key=?", (key,))
@@ -318,7 +317,7 @@ class CollabStore:
         return {"run_id": row["run_id"], "paused": bool(row["paused"]), "checkpoint_paused_nodes": [str(node) for node in nodes]}
 
     def create_run(self, run_id: str, title: str, request: str, complexity: dict[str, Any], agent: str = "claude-code") -> None:
-        self._execute("INSERT INTO runs(id,title,request,status,complexity_json,agent) VALUES(?,?,?,?,?,?)", (run_id, title, request, "created", json.dumps(complexity, ensure_ascii=False), agent))
+        self._execute("INSERT INTO runs(id,title,request,status,complexity_json,agent,created_at,updated_at) VALUES(?,?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)", (run_id, title, request, "created", json.dumps(complexity, ensure_ascii=False), agent))
         self.log(run_id, "info", "run created", {"title": title, "agent": agent})
 
     def update_run(self, run_id: str, status: str) -> None:
@@ -439,11 +438,11 @@ class CollabStore:
                     (run_id,),
                 )
                 self.conn.execute(
-                    "INSERT INTO logs(run_id,node_id,level,message,data_json) VALUES(?,?,?,?,?)",
+                    "INSERT INTO logs(run_id,node_id,level,message,data_json,created_at) VALUES(?,?,?,?,?,CURRENT_TIMESTAMP)",
                     (run_id, None, "error", "run interrupted; stale running work marked failed", json.dumps({"reason": reason}, ensure_ascii=False)),
                 )
                 self.conn.execute(
-                    "INSERT INTO lessons(scope,category,lesson,evidence_json) VALUES(?,?,?,?)",
+                    "INSERT INTO lessons(scope,category,lesson,evidence_json,created_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP)",
                     (
                         "engine",
                         "interrupt-cleanup",
@@ -492,7 +491,7 @@ class CollabStore:
         if snapshot_type not in {"node_completed", "checkpoint", "pre_compaction"}:
             raise ValueError("snapshot_type must be 'node_completed', 'checkpoint', or 'pre_compaction'")
         self._execute(
-            """INSERT INTO context_snapshots(run_id,snapshot_type,node_id,snapshot_json) VALUES(?,?,?,?)""",
+            """INSERT INTO context_snapshots(run_id,snapshot_type,node_id,snapshot_json,created_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP)""",
             (run_id, snapshot_type, node_id, json.dumps(snapshot, ensure_ascii=False)),
         )
 
@@ -534,7 +533,7 @@ class CollabStore:
         self._execute("UPDATE workers SET status=?, duration_seconds=?, session_id=?, error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (status, duration_seconds, session_id, error, worker_id))
 
     def add_lesson(self, category: str, lesson: str, evidence: dict[str, Any] | None = None, scope: str = "global") -> None:
-        self._execute("INSERT INTO lessons(scope,category,lesson,evidence_json) VALUES(?,?,?,?)", (scope, category, lesson, json.dumps(evidence or {}, ensure_ascii=False)))
+        self._execute("INSERT INTO lessons(scope,category,lesson,evidence_json,created_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP)", (scope, category, lesson, json.dumps(evidence or {}, ensure_ascii=False)))
 
     def deduplicate_lessons(self) -> int:
         """Remove duplicate lessons, keeping the newest per group.

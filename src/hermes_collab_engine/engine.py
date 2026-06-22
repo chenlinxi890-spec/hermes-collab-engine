@@ -44,7 +44,9 @@ class CollabEngine:
         model: str | None = None,
         leader_model: str | None = None,
         worker_model: str | None = None,
-        agent: str = "claude-code",
+        agent: str = "opencode",
+        leader_agent: str | None = "hermes",
+        worker_agent: str | None = None,
         skill_registry: SkillRegistry | None = None,
         tool_registry: ToolRegistry | None = None,
         provider: Any = None,
@@ -55,6 +57,8 @@ class CollabEngine:
         self.leader_model = leader_model or model or os.environ.get("HERMES_COLLAB_LEADER_MODEL") or env_model
         self.worker_model = worker_model or model or os.environ.get("HERMES_COLLAB_WORKER_MODEL") or env_model
         self.agent_backend: AgentBackend = get_backend(agent)
+        self.leader_agent: AgentBackend | None = get_backend(leader_agent) if leader_agent else None
+        self.worker_agent: AgentBackend | None = get_backend(worker_agent) if worker_agent else None
         self.provider = provider
         self.skill_registry = skill_registry or get_default_registry()
         self.tool_registry = tool_registry or get_default_tool_registry()
@@ -66,7 +70,7 @@ class CollabEngine:
         # Load agent profiles for leader/worker model overrides
         # Initialize unified registry with store for persistence
         get_unified_registry(store=self.store)
-        self.planner = Planner(self.cwd, model=self.leader_model, store=self.store, skill_registry=self.skill_registry, tool_registry=self.tool_registry)
+        self.planner = Planner(self.cwd, model=self.leader_model, store=self.store, skill_registry=self.skill_registry, tool_registry=self.tool_registry, leader_agent=self.leader_agent)
         self._node_results: dict[str, str] = {}
         self._node_results_struct: dict[str, dict[str, Any] | None] = {}
         self._node_results_lock = threading.Lock()
@@ -437,7 +441,7 @@ class CollabEngine:
                                     if any(r.ok for r in _p_results):
                                         _shard_ids = sorted(split_children[_parent_of_skipped])
                                         _combined_text, _combined_struct = self._combine_shard_results(
-                                            _parent_of_skipped, _shard_ids,
+                                            run_id, _parent_of_skipped, _shard_ids,
                                         )
                                         self.store.update_node(
                                             _parent_of_skipped, "completed",
@@ -1368,11 +1372,9 @@ class CollabEngine:
         plan = self._current_plan
         if plan is None or not plan.shared_brief:
             return ""
-        if node.capability != "implementation":
-            return ""
         if plan.shared_brief in (node.brief or ""):
             return ""
-        return f"Shared brief:\n{plan.shared_brief}\n\n"
+        return f"Completed work summary (upstream workers):\n{plan.shared_brief}\n\n"
 
     def _task_text_for_worker(self, node: WBSNode) -> str:
         return "\n".join(part for part in (node.title, node.deliverable, node.brief, node.description) if part)
@@ -1739,6 +1741,18 @@ class CollabEngine:
         return None
 
     def _run_worker(self, run_id: str, node: WBSNode, timeout: int, model_override: str | None = None, role: str = "worker") -> WorkerResult:
+        # Resolve per-role agent
+        _saved_agent = self.agent_backend
+        if role == "leader" and self.leader_agent:
+            self.agent_backend = self.leader_agent
+        elif role == "worker" and self.worker_agent:
+            self.agent_backend = self.worker_agent
+        try:
+            return self._run_worker_impl(run_id, node, timeout, model_override, role)
+        finally:
+            self.agent_backend = _saved_agent
+
+    def _run_worker_impl(self, run_id: str, node: WBSNode, timeout: int, model_override: str | None = None, role: str = "worker") -> WorkerResult:
         worker_id = f"worker_{run_id}_{node.id}_{node.attempt}"
         self.store.worker_start(worker_id, run_id, node.id)
         self.store.log(run_id, "info", "worker started", {"node": node.id, "title": node.title, "agent": self.agent_backend.name}, node.id)
@@ -1812,6 +1826,15 @@ Output contract:
             self.store.log(run_id, "warning", "prompt truncated for ARG_MAX",
                 {"node": node.id, "original_bytes": _pb_len,
                  "truncated_to": _PROMPT_SAFE_MAX_BYTES}, node.id)
+        # 2026-06-21: second pass — hard cap the EXEC'd arg (prompt) at 900KB
+        # to stay well under 2 MB ARG_MAX even after env expansion.
+        # Use the same byte-aware truncation as above.
+        _pb2 = prompt.encode("utf-8", errors="replace")
+        if len(_pb2) > 900_000:
+            _half2 = 450_000
+            prompt = _pb2[:_half2].decode("utf-8", errors="ignore") \
+                   + "\n...[FINAL ARG_MAX SAFETY TRUNCATION: " + str(len(_pb2)) + " bytes > 900KB limit]...\n" \
+                   + _pb2[-_half2:].decode("utf-8", errors="ignore")
         selected_model = model_override or self.worker_model
         # If prompt is too long for command-line args, use stdin via temp file.
         # Only applies to backends with a prompt_flag (e.g. claude -p "...");
@@ -1971,29 +1994,65 @@ Output contract:
             run_id=run_id,
         )
         self.store.log(run_id, "info" if ok else "error", "worker finished", result.to_dict(), node.id)
+        # Auto-populate shared_brief from successful worker result_struct
+        if ok and result_struct and result_struct.get("summary"):
+            plan = self._current_plan
+            if plan is not None:
+                _entry = f"- {node.title}: {result_struct['summary']}"
+                _files = result_struct.get("files_modified", [])
+                if _files:
+                    _entry += f" (改: {', '.join(_files)})"
+                if plan.shared_brief:
+                    plan.shared_brief += "\n" + _entry
+                else:
+                    plan.shared_brief = _entry
+                self.store.log(run_id, "info", "shared brief updated",
+                    {"node": node.id, "brief_entry": _entry}, node.id)
         if tmp_path:
             try: os.unlink(tmp_path)
             except OSError: pass
         return result
 
+    def _combine_shard_results(self, run_id: str, parent_id: str, shard_ids: list[str]) -> tuple[str, dict]:
+        """Combine shard results under a parent node into a single text+struct.
+        
+        Reads each shard's result from the store, concatenates them ordered
+        by shard ID, and merges their structs.
+        """
+        texts: list[str] = []
+        structs: list[dict] = []
+        for sid in shard_ids:
+            node_data = self.store.get_node(run_id, sid)
+            if node_data and node_data.get("result"):
+                texts.append(str(node_data["result"]))
+            if node_data and node_data.get("result_struct_json"):
+                try:
+                    structs.append(json.loads(node_data["result_struct_json"]))
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        combined_text = "\n\n---\n\n".join(texts) if texts else ""
+        combined_struct = {}
+        for s in structs:
+            combined_struct.update(s)
+        return combined_text, combined_struct
+
     def _aggregate(self, run_id: str, request: str, results: list[WorkerResult], timeout: int) -> WorkerResult:
+
         node = WBSNode(f"{run_id}-aggregate", "Aggregate results", "Aggregate worker outputs into final answer", "aggregation", 5, [], False, "Final answer")
         self.store.insert_wbs_node(run_id, node.to_dict())
         self.store.update_node(node.id, "running", run_id=run_id)
-        # 2026-06-19 fix: strip large result bodies to prevent prompt exceeding
-        # ARG_MAX (~2MB). Worker result.result can contain entire file contents.
-        _AGGREGATE_RESULT_MAX_CHARS = 500
-        trimmed = []
+        # 2026-06-21: Use result_struct.summary instead of full result text
+        # to prevent ARG_MAX overflow. Each worker's summary is short (~100 chars).
+        summaries = []
         for r in results:
-            d = r.to_dict()
-            if d.get("result") and len(d["result"]) > _AGGREGATE_RESULT_MAX_CHARS:
-                d["result"] = d["result"][:_AGGREGATE_RESULT_MAX_CHARS] + f"\n... [truncated {len(d['result'])} chars]"
-            if d.get("result_struct") and isinstance(d["result_struct"], dict):
-                rs_json = json.dumps(d["result_struct"], ensure_ascii=False)
-                if len(rs_json) > 500:
-                    d["result_struct"] = {"_truncated": f"result_struct too large ({len(rs_json)} chars)"}
-            trimmed.append(d)
-        report = json.dumps(trimmed, ensure_ascii=False, indent=2)
+            summary = (r.result_struct or {}).get("summary", "") if r.result_struct else ""
+            files = (r.result_struct or {}).get("files_modified", []) if r.result_struct else []
+            status = "✅" if r.ok else "❌"
+            entry = f"{status} {r.title}: {summary[:200]}"
+            if files:
+                entry += f" (改: {', '.join(files)})"
+            summaries.append(entry)
+        report = "\n".join(summaries)
         _AGGREGATE_REQUEST_MAX_CHARS = 500
         if len(request) > _AGGREGATE_REQUEST_MAX_CHARS:
             request = request[:_AGGREGATE_REQUEST_MAX_CHARS] + f"\n... [truncated {len(request)} chars]"

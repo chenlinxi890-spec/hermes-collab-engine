@@ -86,12 +86,36 @@ EOF
   chmod +x "$target"
 }
 
-echo "==> 检查基础依赖"
-need_cmd git
 need_cmd python3
+need_cmd git
 need_cmd curl
-if [ "$missing" -ne 0 ]; then
+
+if [ "$missing" -eq 1 ]; then
   print_dependency_help
+  exit 1
+fi
+
+echo "  ✓ python3 $(python3 --version 2>&1)"
+echo ""
+
+# ── Check required CLI agents for engine operation ──
+missing_agent=0
+need_agent() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "  ❌ $1: 未安装 — $2"
+    missing_agent=1
+  else
+    echo "  ✓ $1: $(command -v "$1")"
+  fi
+}
+echo "=== 检查 Agent CLI ==="
+need_agent hermes "Leader Agent（必需）— 参考 https://hermes-agent.nousresearch.com 安装"
+need_agent opencode "Worker Agent（必需）— 通过 npm install -g opencode-ai 或参考 opencode.ai 安装"
+echo ""
+
+if [ "$missing_agent" -eq 1 ]; then
+  echo "请安装缺失的 Agent 后重试。"
+  echo "本脚本不会自动安装外部 CLI 工具。"
   exit 1
 fi
 
@@ -148,30 +172,18 @@ else
   echo "    cd '$INSTALL_DIR/proxy' && go build -o opencode-proxy ./cmd/server"
 fi
 
-if ! command -v claude >/dev/null 2>&1; then
-  echo ""
-  echo "提示: 未找到 Claude Code CLI: claude"
-  echo "如需使用 claude-code worker，请先安装并登录 Claude Code:"
-  echo "  https://docs.anthropic.com/en/docs/claude-code"
-fi
-
-if ! command -v hermes >/dev/null 2>&1; then
-  echo ""
-  echo "提示: 未找到 Hermes CLI: hermes"
-  echo "本脚本不会自动执行远程安装脚本；如需 launcher 模式，请按官方文档安装 Hermes。"
-fi
-
 echo ""
-echo "其他 Worker Agent (opencode, openclaw, cursor 等) 可通过 opc add-agent <name> 动态添加"
-echo ""
-echo "==> 安装完成"
+echo "==> 总结"
 echo "仓库: $INSTALL_DIR"
 echo "Python: $PYTHON_BIN"
-echo "模板: $INSTALL_DIR/templates"
 echo "命令:"
-echo "  $BIN_DIR/opc                  # 选择模型并启动面板，然后进入 Hermes 命令行"
-echo "  $BIN_DIR/hermes-collab --help # 查看协同引擎 CLI"
-echo "  cd '$INSTALL_DIR' && ./scripts/install-hermes-integration.sh --target-dir ./tmp/hermes-template"
+echo "  $BIN_DIR/opc                  # 选择模型并启动面板"
+echo "  $BIN_DIR/hermes-collab --help # 引擎 CLI"
+echo "  hermes -z \"任务描述\"          # 直接运行（Leader 模式）"
+echo "  opencode run \"任务描述\"       # 直接运行（Worker 模式）"
+echo ""
+echo "启动引擎面板:"
+echo "  hermes-collab server --host 0.0.0.0 --port 8765 --cwd '$INSTALL_DIR'"
 echo ""
 echo "如果 $BIN_DIR 不在 PATH 中，请执行:"
 echo "  export PATH=\"$BIN_DIR:\$PATH\""

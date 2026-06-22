@@ -54,6 +54,20 @@
         "list_blocks",
         "get_block"
       ]
+    },
+    "puppeteer": {
+      "command": "bash",
+      "args": ["scripts/run-puppeteer-mcp.sh"],
+      "env": {},
+      "tools": [
+        "puppeteer_navigate",
+        "puppeteer_screenshot",
+        "puppeteer_click",
+        "puppeteer_fill",
+        "puppeteer_hover",
+        "puppeteer_evaluate",
+        "puppeteer_close"
+      ]
     }
   }
 }

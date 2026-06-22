@@ -276,7 +276,7 @@ _register_builtin(AgentBackend(
     name="hermes",
     display_name="Hermes Agent",
     command=["hermes"],
-    prompt_flag="",
+    prompt_flag="-z",
     output_format_flags=[],
     supports_model_flag=True,
     model_flag="--model",

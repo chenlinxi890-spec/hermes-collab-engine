@@ -85,7 +85,7 @@ def main() -> int:
     run.add_argument("--model", help="Use the same model for leader and workers")
     run.add_argument("--leader-model", help="Leader brain model for planning and aggregation")
     run.add_argument("--worker-model", help="Worker brain model for coding workers")
-    run.add_argument("--agent", default="opencode", help="Agent backend: opencode (default, OMO-enhanced), claude-code, codex, hermes, or custom")
+    run.add_argument("--agent", default="opencode", help="Agent backend: opencode (default), claude-code, codex, hermes, or custom")
     run.add_argument("--concurrency", type=int, default=2, help="Per-run in-flight workers (threads in run's pool)")
     run.add_argument("--global-max-concurrent", type=int, default=4, help="Global cap on opencode worker processes across ALL runs. Prevents 4-run storm (4GB RAM death spiral).")
     run.add_argument("--timeout", type=int, default=86400)
@@ -106,7 +106,7 @@ def main() -> int:
     server.add_argument("--model", help="Use the same model for leader and workers")
     server.add_argument("--leader-model", help="Leader brain model for planning and aggregation")
     server.add_argument("--worker-model", help="Worker brain model for coding workers")
-    server.add_argument("--agent", default="opencode", help="Agent backend: opencode (default, OMO-enhanced), claude-code, codex, hermes, or custom")
+    server.add_argument("--agent", default="opencode", help="Agent backend: opencode (default), claude-code, codex, hermes, or custom")
 
     status = sub.add_parser("status", help="Show engine status")
     status.add_argument("--db", default="data/collab.sqlite3")

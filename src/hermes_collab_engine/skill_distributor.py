@@ -72,9 +72,9 @@ SKILL_MCP_MAP: dict[str, dict] = {
         "readonly": True,
     },
     "browser-automation": {
-        "mcp_servers": [],
-        "agent_compat": [],
-        "readonly": True,
+        "mcp_servers": ["puppeteer"],
+        "agent_compat": ["claude-code", "hermes", "opencode"],
+        "readonly": False,
     },
     "frontend-optimization": {
         "mcp_servers": ["daisyui"],

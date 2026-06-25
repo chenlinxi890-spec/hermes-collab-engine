@@ -92,6 +92,18 @@ class DashboardServer:
                     self._json(outer.store.lessons())
                 elif path == "/api/session-chains":
                     self._json(outer.store.session_chains())
+                elif path == "/api/sessions":
+                    self._json(outer.store.list_sessions())
+                elif path.startswith("/api/sessions/"):
+                    parts = path.rstrip("/").split("/")
+                    session_id = parts[3]
+                    if len(parts) >= 5 and parts[4] == "turns":
+                        self._json(outer.store.list_turns(session_id))
+                    else:
+                        session = outer.store.get_session(session_id)
+                        if session:
+                            session["turns"] = outer.store.list_turns(session_id)
+                        self._json(session or {"error": "not found"}, 200 if session else 404)
                 elif path == "/api/agents":
                     from .agents import detect_available_backends
                     self._json([b.to_dict() for b in detect_available_backends()])
@@ -208,10 +220,11 @@ class DashboardServer:
                             request,
                             title=title,
                             concurrency=int(data.get("concurrency", 4)),
-                            timeout=int(data.get("timeout", 900)),
+                            timeout=int(data.get("timeout", 86400)),
                             max_retries=int(data.get("max_retries", 2)),
                             split_count=int(data.get("split_count", 4)),
                             aggregate=bool(data.get("aggregate", True)),
+                            session_id=data.get("session_id"),
                         )
                         if resume_context and result.get("run_id"):
                             outer.store.log(result["run_id"], "info", "run resumed previous context", {"source_run_id": resume_context["run"]["id"], "estimated_tokens": resume_context["estimated_tokens"]})
@@ -221,6 +234,24 @@ class DashboardServer:
                     if resume_context:
                         payload["resume"] = {"source_run_id": resume_context["run"]["id"], "estimated_tokens": resume_context["estimated_tokens"]}
                     self._json(payload)
+                elif path == "/api/sessions":
+                    user_id = str(data.get("user_id", "default"))
+                    title = str(data.get("title", ""))
+                    session = outer.store.create_session(user_id, title)
+                    self._json(session)
+                elif path.startswith("/api/sessions/") and path.endswith("/turns"):
+                    parts = path.rstrip("/").split("/")
+                    session_id = parts[3]
+                    run_id = str(data.get("run_id", ""))
+                    user_request = str(data.get("user_request", ""))
+                    aggregate = str(data.get("aggregate", ""))
+                    turn_index = data.get("turn_index")
+                    if turn_index is not None:
+                        turn_index = int(turn_index)
+                    if not run_id or not user_request:
+                        return self._json({"error": "run_id and user_request are required"}, 400)
+                    turn = outer.store.add_turn(session_id, run_id, user_request, aggregate, turn_index)
+                    self._json(turn)
                 elif path.startswith("/api/runs/") and path.endswith("/interrupt"):
                     run_id = path.split("/")[3]
                     run = outer.store._one("SELECT id,status FROM runs WHERE id=?", (run_id,))
@@ -389,6 +420,19 @@ class DashboardServer:
                     saved.update(updates)
                     outer.store.set_setting("web_config", saved)
                     return self._json(outer.config_payload())
+                if path.startswith("/api/sessions/"):
+                    parts = path.rstrip("/").split("/")
+                    session_id = parts[3]
+                    session = outer.store.update_session(
+                        session_id,
+                        status=str(data.get("status")) if data.get("status") else None,
+                        title=str(data.get("title")) if data.get("title") else None,
+                    )
+                    if session:
+                        self._json(session)
+                    else:
+                        self._json({"error": "not found"}, 404)
+                    return
                 self._json({"error": "not found"}, 404)
 
             def do_DELETE(self):

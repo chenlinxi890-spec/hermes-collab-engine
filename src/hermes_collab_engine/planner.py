@@ -230,6 +230,63 @@ No prose, no code fences outside the JSON, just the array.
                 node.checkpoint = True
         return nodes
 
+    # ── Write-target validation ──────────────────────────────────────
+    _WRITE_CAPS = {"implementation", "coding", "debugging", "docs"}
+
+    def _validate_write_targets(self, nodes: list[WBSNode]) -> list[dict]:
+        """Check that implementation nodes have specific write_targets.
+        Returns a list of warning dicts — not blocking, but logged.
+        """
+        warnings: list[dict] = []
+        impl_nodes = [n for n in nodes if n.capability in self._WRITE_CAPS]
+        for node in impl_nodes:
+            if not node.write_targets:
+                warnings.append({
+                    "node": node.id,
+                    "severity": "warning",
+                    "message": f"write_targets is empty for {node.capability} node '{node.id}'. "
+                               "Engine will default to '.' which may cause write conflicts.",
+                })
+            elif any(t == "." for t in node.write_targets):
+                warnings.append({
+                    "node": node.id,
+                    "severity": "warning",
+                    "message": f"write_targets contains '.' for {node.capability} node '{node.id}'. "
+                               "A broad '.' target may conflict with other implementation nodes. "
+                               "Use specific file/directory paths instead.",
+                })
+        # Cross-node overlap check: if two implementation nodes both target '.'
+        # or one targets a subpath of another, flag it.
+        for i, a in enumerate(impl_nodes):
+            for b in impl_nodes[i + 1:]:
+                a_set = set(a.write_targets) if a.write_targets else {"."}
+                b_set = set(b.write_targets) if b.write_targets else {"."}
+                for ta in a_set:
+                    for tb in b_set:
+                        if self._write_targets_conflict(ta, tb):
+                            warnings.append({
+                                "node": f"{a.id} <-> {b.id}",
+                                "severity": "warn",
+                                "message": f"write_targets overlap between '{a.id}' ({ta}) and "
+                                           f"'{b.id}' ({tb}). They will be serialized (blocked). "
+                                           "Consider narrowing targets for parallel execution.",
+                            })
+        return warnings
+
+    @staticmethod
+    def _write_targets_conflict(a: str, b: str) -> bool:
+        """Check if two write targets overlap (one contains the other)."""
+        if a == "." or b == ".":
+            return True
+        norm_a = a.rstrip("/")
+        norm_b = b.rstrip("/")
+        if norm_a == norm_b:
+            return True
+        if (norm_a + "/").startswith(norm_b + "/") or (norm_b + "/").startswith(norm_a + "/"):
+            return True
+        import fnmatch
+        return fnmatch.fnmatch(norm_a, norm_b) or fnmatch.fnmatch(norm_b, norm_a)
+
     def decompose(self, request: str, max_nodes: int = 8, capabilities: list[str] | None = None,
                   agent_backend: Any = None) -> Plan:
         lessons_block = self._load_recent_lessons()
@@ -303,6 +360,7 @@ Return ONLY one JSON object with this schema:
 {caps_block}{available_skills_block}{available_tools_block}skills_json and tools_json are optional. From the lists above, select the skills and tools that fit each node and set them as a JSON array string (e.g. "[\\"test-verify\\",\\"file-edit\\"]"). Leave "" to let the engine auto-select.
 Create 4-{max_nodes} WBS nodes. complexity must be 1-10. estimated_duration is seconds and should be a positive integer.
 Set write_targets to repository-relative files or directories each implementation node may write; use [] for read-only nodes.
+**WARNING for implementation/coding/debugging/docs nodes**: write_targets MUST be specific file or directory paths (e.g. `["src/backend/server.py", "src/user-app/"]`). Do NOT use `["."]` — it causes write conflicts when multiple implementation nodes run in parallel. Do NOT leave `[]` empty for implementation nodes — the engine cannot block a concurrent sibling that also writes to the same file. When two implementation nodes share write targets, they will be serialized correctly; when they don't, they can run safely in parallel.
 Design nodes so independent work can run in parallel while write-heavy implementation is sequenced safely.
 No prose, no code fences outside the JSON, just the object.
 """
@@ -470,6 +528,13 @@ No prose, no code fences outside the JSON, just the object.
         )
         for node in nodes:
             node.fingerprint = node.fingerprint or self._node_fingerprint(node)
+        # Validate write targets and log warnings
+        wt_warnings = self._validate_write_targets(nodes)
+        if wt_warnings:
+            import logging
+            _log = logging.getLogger(__name__)
+            for w in wt_warnings:
+                _log.warning("[WBS] %s: %s", w["node"], w["message"])
         return Plan(nodes=nodes, shared_brief=shared_brief)
 
     def _claude_json(self, prompt: str):

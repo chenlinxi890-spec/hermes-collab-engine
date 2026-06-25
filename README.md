@@ -70,9 +70,19 @@ hermes-collab server --host 0.0.0.0 --port 8765 --cwd .
 - `engine-memory` skill：Hermes 端加载引擎 lessons
 
 ### 管理端 MCP 重构
-- MCP 页面改为只读展示
-- 后端新增 POST/DELETE/reload 端点
-- Puppeteer MCP 浏览器自动化（7 个工具）
+- MCP 页面改为只读展示，支持描述字段和实时健康检查
+- 注册/编辑/删除 MCP 服务器（持久化到 mcp-config.json）
+- 传输类型选择：stdio / gitmcp / SSE
+- 测试通信按钮：真实 MCP 协议 tools/list 握手
+
+### Guardian 实时守护
+- **Leader 注意力轮询**：每 15s 读取 worker stdout，Leader 实时判断方向
+- 方向正确 → continue（不干预）；方向偏离 → off_track（打断重派）
+- `[GUARDIAN:NEED_INPUT]` 标记 → 暂停 worker，等待用户确认（如扫码登录）
+- 30s 无输出 → 自动触发 Leader 审核
+- 重复错误检测 → 自动触发 Leader 审核
+- 每次注意力 ~280 tokens，一个 1 分钟任务约 4 次 = ~1,120 tokens
+- 防跑偏场景：可节省 90%+ 失败重跑成本
 
 ### Lesson 质量体系
 - scope（L1/L2/L3）+ tags
@@ -138,13 +148,17 @@ sandbox --port 8877  # 自定义端口
 ## 架构
 
 ```
-用户 → Leader (WBS 拆解) → Worker × N 并行 → 聚合 → 结果
+用户 → Leader (WBS 拆解 + 实时守护) → Worker × N (并行执行) → 聚合 → 结果
                               │
                          Agent Backend
                     (Hermes Leader / OpenCode Worker)
                               │
                         MCP 工具池
                    (搜索/浏览器/UI 组件)
+                              │
+                       Guardian 守护线程
+                   (Leader 注意力轮询 / NEED_INPUT
+                    超时检测 / 错误循环检测)
 ```
 
 | 层 | 技术 |

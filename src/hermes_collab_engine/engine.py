@@ -77,6 +77,7 @@ class CollabEngine:
         self._current_plan: Plan | None = None
         self._risk_assessments: list[dict[str, Any]] = []
         self._checkpoint_paused_nodes: set[str] = set()
+        self._current_session_id: str | None = None
         self._paused_runs: set[str] = set()
         self._file_allowlist: set[str] = set()
         self._active_write_targets: dict[str, set[str]] = {}
@@ -214,11 +215,13 @@ class CollabEngine:
             "checkpoint_paused_nodes": sorted(self._checkpoint_paused_nodes),
         }
 
-    def run(self, request: str, *, title: str | None = None, concurrency: int = 4, timeout: int = 86400, max_retries: int = 2, split_count: int = 4, aggregate: bool = True, package: str | None = None, package_skills: list[str] | None = None) -> dict:
+    def run(self, request: str, *, title: str | None = None, concurrency: int = 4, timeout: int = 86400, max_retries: int = 2, split_count: int = 4, aggregate: bool = True, package: str | None = None, package_skills: list[str] | None = None, session_id: str | None = None) -> dict:
         run_id = "run_" + uuid.uuid4().hex[:12]
         score = self.planner.assess(request)
         self.store.create_run(run_id, title or request[:80], request, score.to_dict(), agent=self.agent_backend.name)
         self.store.log(run_id, "info", "complexity assessed", score.to_dict())
+        if session_id:
+            self.store.add_turn(session_id, run_id, request)
         # Persist package + the Skill collection it triggered so the dashboard
         # and downstream workers can see which scenario Leader picked.
         # If a package is set, also try to read its graph definition and
@@ -304,6 +307,7 @@ class CollabEngine:
             self._checkpoint_paused_nodes = set(run_state.get("checkpoint_paused_nodes") or [])
         else:
             self._checkpoint_paused_nodes = set()
+        self._current_session_id = session_id
         self.store.update_run(run_id, "running")
         started_at = time.time()  # total run budget clock
 
@@ -408,7 +412,7 @@ class CollabEngine:
 
                         # ── Total run budget check ──────────────────────────
                         remaining_budget = max(0, timeout - (time.time() - started_at))
-                        if remaining_budget < 30 and completed:
+                        if remaining_budget < 30:
                             self.store.log(
                                 run_id, "warning",
                                 "run budget running low",
@@ -477,6 +481,10 @@ class CollabEngine:
                     if not running:
                         if self._checkpoint_paused_nodes:
                             break
+                        # Tight-spin guard: if pending nodes exist but nothing can
+                        # dispatch, back off to prevent 100% CPU ghost loop.
+                        if pending:
+                            time.sleep(5)
                         # Deferred recovery: if resources available, re-dispatch killed nodes
                         if deferred_queue:
                             cpu_now = self._get_cpu_percent() or 0
@@ -622,6 +630,14 @@ class CollabEngine:
                                 pending.clear()
                                 break
 
+            # Post-execution file conflict detection
+            conflicts = self._detect_file_conflicts(run_id, results)
+            if conflicts:
+                self.store.log(run_id, "warn",
+                    f"File conflicts found: {len(conflicts)} file(s) written by multiple workers. "
+                    "The last worker's changes may overwrite earlier work.",
+                    {"conflicts": conflicts})
+
             final = None
             if aggregate:
                 final = self._aggregate(run_id, request, results, timeout)
@@ -641,6 +657,12 @@ class CollabEngine:
             ok = not failed_final and (final.ok if final else True)
             self.store.update_run(run_id, "completed" if ok else "failed")
             self.store.log(run_id, "info" if ok else "error", "run finished", {"ok": ok})
+
+            # Update session turn aggregate so subsequent turns can see the
+            # assistant's summary from this run in session_context().
+            if session_id and final and final.ok and final.result:
+                summary = final.result[:2000]
+                self.store.update_turn_aggregate(session_id, run_id, summary)
 
             # Collect high-value lessons for parent (Hermes) memory mapping
             _EXCLUDED_CATEGORIES = {"planning", "worker-contract"}
@@ -674,6 +696,7 @@ class CollabEngine:
             self._checkpoint_paused_nodes.clear()
             self._paused_runs.discard(run_id)
             self._resource_timeout_nodes.clear()
+            self._current_session_id = None
 
     def _node_fingerprint(self, node: WBSNode) -> str:
         if node.fingerprint:
@@ -1793,13 +1816,18 @@ class CollabEngine:
         write_block = ""
         if write_targets:
             write_block = "Write targets reserved for this worker: " + ", ".join(sorted(write_targets)) + "\nOnly modify files under these repository-relative targets.\n\n"
+        session_block = ""
+        if self._current_session_id:
+            ctx = self.store.session_context(self._current_session_id)
+            if ctx:
+                session_block = f"\n{ctx}\n\n"
         prompt = f"""{backend.prompt_prefix}
 
 WBS node: {node.title}
 Capability: {node.capability}
 Deliverable: {node.deliverable}
 
-{skills_block}{tools_block}{mcp_block}{write_block}{shared_brief_block}{brief_block}{upstream_block}Task:
+{skills_block}{tools_block}{mcp_block}{write_block}{session_block}{shared_brief_block}{brief_block}{upstream_block}Task:
 {node.description}
 
 Work in cwd: {self.cwd}
@@ -2084,6 +2112,39 @@ Output contract:
         slow = [r for r in results if r.duration_seconds > 120 and r.ok]
         if slow:
             self.store.add_lesson("planning", f"Run {run_id}: {len(slow)} slow successful worker(s); consider smaller WBS nodes for similar tasks.", {"run_id": run_id})
+
+    # ── Post-execution file conflict detection ──────────────────────
+    def _detect_file_conflicts(self, run_id: str, results: list[WorkerResult]) -> list[dict]:
+        """Check if multiple workers wrote to the same file.
+        Parses HERMES-COLLAB-RESULT JSON from each worker's output for
+        files_modified, then finds overlapping entries.
+        Returns list of conflict dicts, each with file path and node ids.
+        """
+        file_to_nodes: dict[str, list[str]] = {}
+        for r in results:
+            if not r.ok or not r.result:
+                continue
+            try:
+                # Parse the HERMES-COLLAB-RESULT JSON at end of result text
+                contract, _ = self._parse_result_contract(r.result)
+                if contract and isinstance(contract.get("files_modified"), list):
+                    for f in contract["files_modified"]:
+                        if isinstance(f, str) and f.strip():
+                            file_to_nodes.setdefault(f.strip(), []).append(r.node_id)
+            except Exception:
+                pass
+
+        conflicts = []
+        for file_path, node_ids in file_to_nodes.items():
+            if len(node_ids) > 1:
+                conflicts.append({
+                    "file": file_path,
+                    "nodes": node_ids,
+                })
+                self.store.log(run_id, "warn",
+                    f"FILE CONFLICT: '{file_path}' modified by {len(node_ids)} workers: {', '.join(node_ids)}",
+                    {"file": file_path, "nodes": node_ids})
+        return conflicts
 
     # ------------------------------------------------------------------
     # v3: Checkpoint, risk detection, pause/resume, redo-node

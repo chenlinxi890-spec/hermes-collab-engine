@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value_json TEXT NOT NU
 CREATE TABLE IF NOT EXISTS node_results (node_id TEXT PRIMARY KEY,run_id TEXT NOT NULL,result_text TEXT DEFAULT '',result_struct_json TEXT DEFAULT NULL,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS run_state (run_id TEXT PRIMARY KEY,paused INTEGER DEFAULT 0,checkpoint_paused_nodes_json TEXT DEFAULT '[]',updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS context_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT,run_id TEXT NOT NULL,snapshot_type TEXT NOT NULL,node_id TEXT DEFAULT NULL,snapshot_json TEXT NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY,user_id TEXT NOT NULL,title TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'active',created_at TEXT DEFAULT CURRENT_TIMESTAMP,updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS session_turns (id INTEGER PRIMARY KEY AUTOINCREMENT,session_id TEXT NOT NULL,run_id TEXT NOT NULL,user_request TEXT NOT NULL,aggregate TEXT NOT NULL DEFAULT '',turn_index INTEGER NOT NULL,created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 """
 
 
@@ -351,6 +353,117 @@ class CollabStore:
     def latest_run_id(self) -> str | None:
         row = self._one("SELECT id FROM runs ORDER BY created_at DESC LIMIT 1")
         return row["id"] if row else None
+
+    # ── Sessions API ────────────────────────────────────────────────
+
+    def create_session(self, user_id: str = "default", title: str = "") -> dict:
+        import uuid
+        session_id = f"ses_{uuid.uuid4().hex[:12]}"
+        self._execute(
+            "INSERT INTO sessions(id,user_id,title,status,created_at,updated_at) VALUES(?,?,?,?,datetime('now','localtime'),datetime('now','localtime'))",
+            (session_id, user_id, title, "active"),
+        )
+        return {"id": session_id, "user_id": user_id, "title": title, "status": "active"}
+
+    def list_sessions(self, user_id: str = "default") -> list[dict]:
+        rows = self._query(
+            "SELECT id,user_id,title,status,created_at,updated_at FROM sessions WHERE user_id=? ORDER BY created_at DESC LIMIT 20",
+            (user_id,),
+        )
+        return [dict(r) for r in rows]
+
+    def get_session(self, session_id: str) -> dict | None:
+        row = self._one(
+            "SELECT id,user_id,title,status,created_at,updated_at FROM sessions WHERE id=?",
+            (session_id,),
+        )
+        return dict(row) if row else None
+
+    def update_session(self, session_id: str, status: str | None = None, title: str | None = None) -> dict | None:
+        sets: list[str] = []
+        params: list[str] = []
+        if status is not None:
+            sets.append("status=?")
+            params.append(status)
+        if title is not None:
+            sets.append("title=?")
+            params.append(title)
+        if not sets:
+            return self.get_session(session_id)
+        sets.append("updated_at=datetime('now','localtime')")
+        params.append(session_id)
+        self._execute(
+            f"UPDATE sessions SET {','.join(sets)} WHERE id=?",
+            tuple(params),
+        )
+        return self.get_session(session_id)
+
+    def add_turn(self, session_id: str, run_id: str, user_request: str, aggregate: str = "", turn_index: int | None = None) -> dict:
+        if turn_index is None:
+            row = self._one(
+                "SELECT COALESCE(MAX(turn_index), -1) + 1 AS next_idx FROM session_turns WHERE session_id=?",
+                (session_id,),
+            )
+            turn_index = row["next_idx"] if row else 0
+        self._execute(
+            "INSERT INTO session_turns(session_id,run_id,user_request,aggregate,turn_index,created_at) VALUES(?,?,?,?,?,datetime('now','localtime'))",
+            (session_id, run_id, user_request, aggregate, turn_index),
+        )
+        self._execute(
+            "UPDATE sessions SET updated_at=datetime('now','localtime') WHERE id=?",
+            (session_id,),
+        )
+        return {"session_id": session_id, "run_id": run_id, "turn_index": turn_index}
+
+    def list_turns(self, session_id: str) -> list[dict]:
+        rows = self._query(
+            "SELECT id,session_id,run_id,user_request,aggregate,turn_index,created_at FROM session_turns WHERE session_id=? ORDER BY turn_index ASC",
+            (session_id,),
+        )
+        return [dict(r) for r in rows]
+
+    def update_turn_aggregate(self, session_id: str, run_id: str, aggregate: str) -> None:
+        """Update the aggregate field of the session_turn for a completed run.
+
+        Called after a session-backed run finishes so that subsequent turns
+        see the assistant's summary from prior turns.
+        """
+        self._execute(
+            "UPDATE session_turns SET aggregate=? WHERE session_id=? AND run_id=?",
+            (aggregate, session_id, run_id),
+        )
+
+    def session_context(self, session_id: str, max_turns: int = 10) -> str:
+        """Return formatted turn history for a session, for injection into worker prompts.
+
+        Returns an empty string if the session does not exist or has no turns.
+        """
+        session = self.get_session(session_id)
+        if not session:
+            return ""
+        turns = self.list_turns(session_id)
+        if not turns:
+            return ""
+        recent = turns[-max_turns:]
+        lines: list[str] = [
+            f"=== Session History (session: {session_id}) ===",
+            f"Session title: {session.get('title', '')}",
+            f"Session status: {session.get('status', '')}",
+        ]
+        for t in recent:
+            idx = t["turn_index"]
+            req = (t["user_request"] or "")[:2000]
+            rid = t.get("run_id", "")
+            rid_suffix = f" (run: {rid})" if rid else ""
+            lines.append(f"\n--- Turn {idx}{rid_suffix} ---")
+            lines.append(f"User: {req}")
+            agg = t.get("aggregate", "") or ""
+            if agg:
+                lines.append(f"Assistant aggregate: {agg[:2000]}")
+        lines.append("\n=== End Session History ===")
+        return "\n".join(lines)
+
+    # ── Context / Resume ────────────────────────────────────────────
 
     def resume_context(self, run_id: str | None = None, *, node_limit: int = 4, log_limit: int = 8) -> dict[str, Any] | None:
         run_id = run_id or self.latest_run_id()

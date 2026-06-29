@@ -1,4 +1,4 @@
-# Contributing to Hermes Collab Engine
+﻿# Contributing to Hermes Collab Engine
 
 Thanks for helping improve Hermes Collab Engine. This project coordinates AI workers, local dashboards, sandbox runs, and release documentation, so small, well-scoped contributions are easiest to review.
 
@@ -29,6 +29,15 @@ Use the GitHub issue templates when possible:
 
 Please keep one issue focused on one problem. Security vulnerabilities should not be filed as public issues; follow [`SECURITY.md`](SECURITY.md).
 
+
+### Suggested labels for triage
+
+- good first issue — small, well-scoped tasks for newcomers
+- documentation — docs, README, guides, issue templates
+- 	ests — test additions, test fixes, test infrastructure
+- dashboard — dashboard UI, layout, components
+- sandbox — sandbox configuration, examples, README
+- security — vulnerabilities (see [SECURITY.md](SECURITY.md))
 ## Pull request workflow
 
 - Open focused PRs with a clear summary, linked issue, and verification commands.
@@ -57,3 +66,4 @@ Hermes Collab Engine should remain safe for public release:
 - Do not make sandbox examples call real workers by default.
 - Keep dashboard exposure local-first unless a deployment guide explicitly adds authentication, network binding guidance, and risk warnings.
 - Do not broaden tool permissions, git write access, or process execution without documenting the reason and review path.
+
